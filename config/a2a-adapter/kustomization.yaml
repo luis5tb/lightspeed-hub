@@ -1,0 +1,39 @@
+# OPTIONAL component: the hub A2A adapter (a2a-adapter/ nested module).
+#
+# Deliberately NOT referenced from config/default — the stock lightspeed-hub
+# deployment is unchanged. Enable by deploying this component on its own:
+#
+#   make deploy-a2a-adapter
+#
+# or by listing it as an extra resource in a custom overlay:
+#
+#   resources:
+#   - ../default
+#   - ../a2a-adapter
+#
+# Required cluster-specific values (keycloak issuer, hub audience, exchange
+# client) have NO defaults by design — see README.md in this directory and
+# patch them before deploying.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Same namespace convention as config/default. This is also the RUN namespace
+# (design §8.3): AgenticRuns, their run-token Secrets, and repo C's sandbox
+# pods live in the lightspeed-agentic-operator namespace — keep the adapter
+# there so the Role/RoleBinding below are exact.
+namespace: openshift-lightspeed
+
+namePrefix: lightspeed-hub-
+
+resources:
+- serviceaccount.yaml
+- role.yaml
+- rolebinding.yaml
+- deployment.yaml
+- service.yaml
+- networkpolicy.yaml
+
+images:
+- name: a2a-adapter
+  newName: quay.io/openshift-lightspeed/lightspeed-hub-a2a-adapter
+  newTag: latest

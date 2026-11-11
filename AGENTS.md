@@ -18,6 +18,14 @@ make fmt        # Run go fmt
 make vet        # Run go vet
 ```
 
+The optional A2A adapter is a separate nested Go module (`a2a-adapter/`)
+with its own targets: `make build-a2a-adapter`, `make test-a2a-adapter`,
+`make image-a2a-adapter`, `make deploy-a2a-adapter`. See
+`docs/a2a-adapter.md`. Its `go.mod` replaces
+`lightspeed-agentic-operator/api` with the sibling checkout at
+`../../lightspeed-agentic-operator/api` (branch `a2a-support`) — those
+targets require that checkout to exist.
+
 ## Conventions
 
 - Follow the same Go patterns as lightspeed-operator and lightspeed-agentic-operator (controller-runtime, kubebuilder markers, `fmt.Errorf("%s: %w", ErrConstant, err)` error wrapping)

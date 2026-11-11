@@ -1,0 +1,24 @@
+# Design doc §1: the adapter's Service gets no public Route and a
+# NetworkPolicy admitting only the Praxis pods' namespace. PATCH the
+# namespace label to the Praxis namespace of your deployment — the default
+# below matches the gitops pattern's placement. Ingress-only, mirroring the
+# gitops chart; egress hardening (kube API, Keycloak, DNS) is a documented
+# open item there.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: a2a-adapter
+spec:
+  policyTypes:
+    - Ingress
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: lightspeed-hub-a2a-adapter
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: REPLACE-ME-praxis-namespace
+      ports:
+        - protocol: TCP
+          port: 8443

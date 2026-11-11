@@ -1,0 +1,115 @@
+# Adapter Deployment. The flags are the adapter's own contract —
+# a2a-adapter/internal/config/config.go is the source of truth. Values with
+# adapter flag defaults mirror those defaults exactly; REQUIRED values with
+# no adapter default (--keycloak-issuer, --hub-audience, exchange client
+# auth) are REPLACE-ME placeholders that MUST be patched per cluster before
+# deploying (see README.md in this directory). The gitops repo's Helm chart
+# (charts/all/lightspeed-hub) is the fully-wired deployment for the
+# validated pattern; this component is the repo-native kustomize equivalent.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: a2a-adapter
+  labels:
+    app.kubernetes.io/name: lightspeed-hub-a2a-adapter
+    app.kubernetes.io/component: a2a-adapter
+    app.kubernetes.io/part-of: lightspeed-hub
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: lightspeed-hub-a2a-adapter
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: lightspeed-hub-a2a-adapter
+        app.kubernetes.io/component: a2a-adapter
+        app.kubernetes.io/part-of: lightspeed-hub
+    spec:
+      serviceAccountName: a2a-adapter # rewritten to the namePrefixed SA by kustomize
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: adapter
+          image: a2a-adapter
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - name: https
+              containerPort: 8443
+              protocol: TCP
+          args:
+            - --listen=:8443
+            # TLS serving from the OpenShift service-serving cert minted
+            # by the Service annotation (Secret a2a-adapter-serving-cert,
+            # mounted below). Plain HTTP (both flags empty) is a LOCAL
+            # DEV shape only.
+            - --tls-cert-file=/etc/a2a-adapter/tls/tls.crt
+            - --tls-key-file=/etc/a2a-adapter/tls/tls.key
+            # --namespace defaults to the pod's own namespace (env
+            # NAMESPACE fallback reads the SA projected namespace file).
+            - --keycloak-issuer=https://keycloak.REPLACE-ME.invalid/realms/rca
+            - --keycloak-token-endpoint=https://keycloak.REPLACE-ME.invalid/realms/rca/protocol/openid-connect/token
+            - --keycloak-client-id=REPLACE-ME
+            - --hub-audience=REPLACE-ME
+            - --target-header=X-Hub-Cluster
+            - --run-agent=default
+            # M3 bounds (design §2.3/§5.5/§6.4) — defaults mirror the
+            # adapter's flag defaults.
+            - --clock-skew=30s
+            - --stream-deadline=30m
+            - --renewal-timeout=15m
+            - --max-credential-pauses=3
+            - --terminal-cleanup-grace=1m
+            - --sweep-interval=5s
+          # The client secret rides the env fallback of
+          # --keycloak-client-secret. For SPIFFE SVID client auth instead,
+          # drop the --keycloak-client-* flags and set SPIFFE_SOCKET (the
+          # socket itself must be provided by the cluster's SPIRE/SPIFFE
+          # deployment — wire the volume in your overlay).
+          env:
+            - name: KEYCLOAK_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: REPLACE-ME-keycloak-client-secret
+                  key: client-secret
+          # Service-serving cert (tls.crt/tls.key, operator-rotated) for
+          # --tls-cert-file/--tls-key-file. The Secret name matches the
+          # Service's serving-cert-secret-name annotation verbatim (NOT
+          # name-prefixed by kustomize — see service.yaml).
+          volumeMounts:
+            - name: serving-cert
+              mountPath: /etc/a2a-adapter/tls
+              readOnly: true
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: https
+              scheme: HTTPS
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: https
+              scheme: HTTPS
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+      volumes:
+        - name: serving-cert
+          secret:
+            secretName: a2a-adapter-serving-cert

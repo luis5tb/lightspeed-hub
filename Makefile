@@ -142,6 +142,57 @@ docker-build: ## Build container image.
 docker-push: ## Push container image.
 	$(CONTAINER_TOOL) push $(IMG)
 
+##@ A2A adapter (optional component)
+
+# The hub A2A adapter is an OPTIONAL component living in its own nested Go
+# module (a2a-adapter/) so the stock operator build does not depend on it.
+# "Building without the A2A surface" is simply not building these targets.
+# Its go.mod has a `replace` pointing the lightspeed-agentic-operator/api
+# module at the sibling checkout ../../lightspeed-agentic-operator/api
+# (branch a2a-support) — required for all targets below.
+A2A_ADAPTER_IMG ?= lightspeed-hub-a2a-adapter:$(VERSION)
+
+.PHONY: build-a2a-adapter
+build-a2a-adapter: ## Build the A2A adapter binary (a2a-adapter nested module).
+	cd a2a-adapter && go build -o ../bin/hub-a2a-adapter ./cmd/hub-a2a-adapter
+
+.PHONY: fmt-a2a-adapter
+fmt-a2a-adapter: ## Verify gofmt produces no changes in the A2A adapter nested module.
+	@out="$$(cd a2a-adapter && gofmt -l .)"; \
+	if [ -n "$$out" ]; then \
+		echo "Unformatted files in a2a-adapter:"; echo "$$out"; exit 1; \
+	fi
+
+.PHONY: vet-a2a-adapter
+vet-a2a-adapter: ## Run go vet against the A2A adapter module.
+	cd a2a-adapter && go vet ./...
+
+.PHONY: test-a2a-adapter
+test-a2a-adapter: fmt-a2a-adapter vet-a2a-adapter ## Run A2A adapter unit tests (fmt + vet + go test with coverage).
+	cd a2a-adapter && go test ./... -cover
+
+.PHONY: image-a2a-adapter
+image-a2a-adapter: ## Build the A2A adapter container image (vendors deps into a staging context).
+	rm -rf .a2a-image-context
+	mkdir -p .a2a-image-context
+	cp -r a2a-adapter .a2a-image-context/a2a-adapter
+	cp LICENSE .a2a-image-context/
+	# Vendor from the real module dir (the sibling replace must resolve),
+	# then move vendor/ into the staging copy so no vendor tree stays in
+	# the repo (it would trip fmt-check's gofmt -l).
+	cd a2a-adapter && go mod vendor && mv vendor ../.a2a-image-context/a2a-adapter/vendor
+	$(CONTAINER_TOOL) build -f Dockerfile --target a2a-adapter -t $(A2A_ADAPTER_IMG) .a2a-image-context
+	rm -rf .a2a-image-context
+
+.PHONY: deploy-a2a-adapter
+deploy-a2a-adapter: kustomize ## Deploy the A2A adapter to the cluster (optional component; NOT part of config/default).
+	cd config/a2a-adapter && $(KUSTOMIZE) edit set image a2a-adapter=$(A2A_ADAPTER_IMG)
+	$(KUSTOMIZE) build config/a2a-adapter | $(KUBECTL) apply -f -
+
+.PHONY: undeploy-a2a-adapter
+undeploy-a2a-adapter: kustomize ## Remove the A2A adapter from the cluster.
+	$(KUSTOMIZE) build config/a2a-adapter | $(KUBECTL) delete --ignore-not-found=$(ignore-not-found) -f -
+
 ##@ Deployment
 
 ifndef ignore-not-found

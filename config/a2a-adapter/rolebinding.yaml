@@ -1,0 +1,11 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: a2a-adapter-run-token-writer
+subjects:
+  - kind: ServiceAccount
+    name: a2a-adapter # rewritten to the namePrefixed SA by kustomize
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: a2a-adapter-run-token-writer

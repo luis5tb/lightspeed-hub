@@ -4,6 +4,14 @@ Multicluster hub operator for OpenShift Lightspeed. Runs on a central hub cluste
 
 The hub operator validates spoke connectivity, provisions credentials for standalone adapters, and monitors spoke health — all driven by two CRDs: `HubConfig` (cluster-wide configuration) and `SpokeCluster` (one per registered spoke).
 
+## Optional components
+
+- **[Hub A2A adapter](docs/a2a-adapter.md)** — an A2A protocol front door
+  bridging A2A task semantics onto `AgenticRun` CRs. Lives in its own
+  nested Go module (`a2a-adapter/`) with its own image and kustomize
+  deployment component (`config/a2a-adapter/`); the stock operator build
+  and deployment are unaffected by it.
+
 ## Prerequisites
 
 The following must be installed on the hub cluster before deploying lightspeed-hub:

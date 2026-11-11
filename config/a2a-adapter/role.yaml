@@ -1,0 +1,39 @@
+# Run-token Secret writer + watch Role in the run namespace, reconciled
+# against the a2a-adapter implementation (see a2a-adapter/README.md "RBAC
+# notes"). Source of truth: the gitops repo's chart
+# charts/all/lightspeed-hub/templates/run-token-writer-rbac.yaml — keep the
+# two in sync.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: a2a-adapter-run-token-writer
+rules:
+  # Run-token Secret writer + terminal-run cleanup (design doc §5.2/§5.5).
+  # create/get/update for the write/renew path, DELETE for the §5.5
+  # terminal-run Secret cleanup and the run-deletion cleanup
+  # (a2a-adapter/internal/server/watch.go Sweep/RunDeleted). Namespace
+  # isolation is the real boundary (no wildcard resourceNames prefix exists
+  # for ls-run-token-*): no other Secrets should live in the run namespace.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "get", "update", "delete"]
+  # Adapter watch grants in the run namespace (design doc §8.1 item 2):
+  # get/list/watch for reads and informers, plus UPDATE for exactly one
+  # write — persisting the §6.4 pause counter as the
+  # a2a.lightspeed.io/credential-pauses annotation
+  # (a2a-adapter/internal/server/watch.go persistPauseCount). The adapter
+  # NEVER writes agenticruns/status or conditions (design §6.1) — no
+  # status-subresource grant.
+  - apiGroups: ["agentic.openshift.io"]
+    resources: ["agenticruns"]
+    verbs: ["get", "list", "watch", "update"]
+  # Approval DECISIONS are patched as the CALLER (Token H) — that
+  # authorization is hub Authentication/RoleBinding wiring (keycloak-oidc
+  # chart work in the gitops repo). The adapter SA itself only READS
+  # approvals (pending-stage derivation), so: get only.
+  - apiGroups: ["agentic.openshift.io"]
+    resources: ["agenticrunapprovals"]
+    verbs: ["get"]
+  - apiGroups: ["agentic.openshift.io"]
+    resources: ["analysisresults", "executionresults", "verificationresults", "escalationresults"]
+    verbs: ["get", "list", "watch"]

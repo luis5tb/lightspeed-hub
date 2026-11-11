@@ -1,0 +1,30 @@
+# Internal-only Service by design (design doc §1): the adapter is reachable
+# ONLY through the Praxis policy gateway. This component deliberately
+# renders NO Route — do not add one; see README.md in this directory.
+#
+# TLS: the annotation makes OpenShift's service-ca operator mint a serving
+# certificate (Secret keys tls.crt/tls.key, rotated by the operator) for
+# this Service; the Deployment mounts that Secret and the adapter serves
+# TLS on 8443 (praxis-proxy's a2aUpstream hop connects over TLS and
+# verifies the service-serving CA). NOTE: the annotation VALUE is the
+# literal Secret name — kustomize's namePrefix does NOT rewrite it — so the
+# Deployment below mounts the same unprefixed name.
+apiVersion: v1
+kind: Service
+metadata:
+  name: a2a-adapter
+  annotations:
+    service.beta.openshift.io/serving-cert-secret-name: a2a-adapter-serving-cert
+  labels:
+    app.kubernetes.io/name: lightspeed-hub-a2a-adapter
+    app.kubernetes.io/component: a2a-adapter
+    app.kubernetes.io/part-of: lightspeed-hub
+spec:
+  type: ClusterIP
+  ports:
+    - name: https
+      port: 8443
+      targetPort: https
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: lightspeed-hub-a2a-adapter

@@ -32,6 +32,16 @@ type Config struct {
 	// target cluster (design §4.2; "X-Hub-Cluster" proposed, renameable
 	// at the chart level).
 	TargetHeader string
+	// AllowedTargets is the parsed allow-list of spoke names (from
+	// --allowed-targets). EMPTY (default) = no enforcement: any
+	// well-formed target is accepted and the kube API admission policy
+	// remains the only target gate. When non-empty, a fresh submit whose
+	// resolved target is not listed fails fast BEFORE any AgenticRun or
+	// run-token Secret is created, with a status message naming the
+	// valid clusters so the caller's retry loop can self-correct on its
+	// next message. This is a UX/validation layer, NOT a security
+	// boundary — the admission policy is the hard gate.
+	AllowedTargets []string
 	// ClockSkew is the grace after exp in the pre-start expiry check
 	// (design §6.2; see auth.Expired).
 	ClockSkew time.Duration
@@ -731,8 +741,12 @@ func (h *Handler) handleSend(ctx context.Context, params *a2a.MessageSendParams)
 			return nil, fmt.Errorf("%w: contextId mismatch for existing task", a2a.ErrInvalidParams)
 		}
 		// Target immutability on resume: a mismatched target is rejected,
-		// never OR-matched (design §5.6).
-		if target != "" && target != rec.Target {
+		// never OR-matched (design §5.6). Immutability protects a BOUND
+		// RUN — a pre-submit record (parked auth-required, or an
+		// adapter-failed allow-list rejection) has no run to protect, and
+		// accepting a corrected target there is exactly the caller's
+		// self-correcting retry loop.
+		if rec.HasRun && target != "" && target != rec.Target {
 			return nil, fmt.Errorf("%w: target is immutable for an existing task", a2a.ErrInvalidParams)
 		}
 	}
@@ -799,6 +813,20 @@ func (h *Handler) handleSend(ctx context.Context, params *a2a.MessageSendParams)
 		target = rec.Target
 	}
 
+	// Fail-fast target allow-list (--allowed-targets): reject an
+	// unlisted target BEFORE any AgenticRun or run-token Secret exists.
+	// The task fails with a message naming the valid clusters, so the
+	// caller's retry loop self-corrects on its next message (a new
+	// message on the same task with a corrected target re-enters this
+	// path — the pre-submit record carries no run to be immutable
+	// about). Empty target (hub-local) is not a spoke and is not
+	// filtered here. NOT a security boundary: the admission policy on
+	// the kube API is the hard gate; this exists to give the caller a
+	// fast, actionable error instead of a run that dies at admission.
+	if target != "" && !h.targetAllowed(target) {
+		return h.failPreSubmitTarget(ctx, rec, taskID, contextID, principal, msg, target)
+	}
+
 	tokenH, err := h.tokenH(ctx, cred)
 	if err != nil {
 		return nil, err
@@ -845,6 +873,56 @@ func (h *Handler) handleSend(ctx context.Context, params *a2a.MessageSendParams)
 	h.deps.Logger.Info("submitted agenticrun",
 		"task_id", taskID, "run", submitted.Name, "run_uid", string(submitted.UID),
 		"principal", principal, "target", target, "credential_fp", cred.Fingerprint)
+	return h.taskFromRecord(ctx, rec)
+}
+
+// targetAllowed reports whether the resolved target passes the allow-list.
+// An empty list enforces nothing (the default; admission policy is the hard
+// gate). The list is sorted at config-parse time, so the failure message
+// names the clusters in a stable order.
+func (h *Handler) targetAllowed(target string) bool {
+	if len(h.cfg.AllowedTargets) == 0 {
+		return true
+	}
+	for _, allowed := range h.cfg.AllowedTargets {
+		if target == allowed {
+			return true
+		}
+	}
+	return false
+}
+
+// failPreSubmitTarget parks the task as adapter-terminally FAILED with a
+// self-correcting status message, following the expired-A pre-create
+// convention: no AgenticRun, no run-token Secret, the record is
+// authoritative. The message names the valid clusters so the caller loop
+// can retry with a corrected target on its next message; the original
+// request text is parked too, so the corrected retry submits it even if
+// the retry message itself carries only the corrected target.
+func (h *Handler) failPreSubmitTarget(ctx context.Context, rec *store.TaskRecord, taskID, contextID, principal string, msg *a2a.Message, target string) (*a2a.Task, error) {
+	if rec == nil {
+		rec = &store.TaskRecord{
+			TaskID:    taskID,
+			ContextID: contextID,
+			Principal: principal,
+			CreatedAt: h.cfg.now(),
+		}
+	}
+	rec.HasRun = false
+	// Target left unset on a fresh record: nothing was bound, and an
+	// unset target keeps the corrected retry out of the immutability
+	// check's way (parked records keep theirs; the !HasRun exemption
+	// covers them).
+	rec.AdapterTerminal = true
+	rec.FailureReason = fmt.Sprintf("unknown target %q; available clusters: %s",
+		target, strings.Join(h.cfg.AllowedTargets, ", "))
+	rec.LastMessageID = msg.ID
+	if rec.PendingRequest == "" {
+		rec.PendingRequest = textOf(msg)
+	}
+	h.deps.Store.PutTask(rec)
+	h.deps.Logger.Warn("rejected target not in allow-list",
+		"task_id", taskID, "target", target, "principal", principal)
 	return h.taskFromRecord(ctx, rec)
 }
 

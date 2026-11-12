@@ -90,6 +90,37 @@ documented in `config/a2a-adapter/README.md`. The fully-wired deployment
 for the Red Hat Validated Pattern lives in the gitops repo's
 `charts/all/lightspeed-hub` Helm chart (disabled by default there too).
 
+## Target cluster validation (who rejects a bad spoke, in order of speed)
+
+1. **MAS orchestrator prompt (assist)** — the caller-facing prompt carries
+   the closed list of cluster names, so the right target is usually chosen
+   in the first place. Advisory: prompts are not enforcement.
+2. **Adapter fail-fast, `--allowed-targets`** — comma-separated spoke
+   names (e.g. `east,west`); empty (default) means no enforcement: any
+   well-formed target is accepted and the admission policy remains the
+   only target gate. When set, a fresh submit whose resolved target is not
+   listed fails BEFORE any AgenticRun or run-token Secret is created: the
+   task parks adapter-terminally failed (the same pre-create convention as
+   the expired-token path) with a self-correcting status message, e.g.
+   `unknown target "est"; available clusters: east, west` — the caller's
+   retry loop re-sends on the same task with a corrected target and a new
+   messageId, and the parked original question is the one submitted. That
+   retry MUST carry the corrected target: a target-less retry on a parked
+   record re-fails with the same message (the park is adapter-terminal,
+   not resumed).
+   Entries must be single DNS labels; malformed entries fail adapter
+   startup. Validation layer, not a security boundary.
+3. **Admission policy (hard gate)** — the kube API admission policy on
+   AgenticRun creation (design §4.3) actually enforces which targets a
+   caller may run against. The allow-list just converts "run dies at
+   admission" into a fast, actionable task failure.
+4. **Praxis router allow-list** — the Praxis policy gateway in front of
+   the adapter routes only approved callers/paths to it at all: the
+   outermost ring of the same story.
+
+Hub-local runs (no target given) are not spoke targets and are not
+filtered by the allow-list.
+
 ## Where things are
 
 | What | Where |

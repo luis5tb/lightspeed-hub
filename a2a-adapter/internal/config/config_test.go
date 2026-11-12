@@ -167,4 +167,50 @@ func TestValidate(t *testing.T) {
 			}
 		})
 	}
+
+	// --allowed-targets: empty = no enforcement (nil slice); set = parsed
+	// sorted de-duplicated; malformed entries fail loudly at startup.
+	t.Run("allowed targets empty by default", func(t *testing.T) {
+		c := validCfg()
+		if err := c.Validate(); err != nil {
+			t.Fatalf("valid config rejected: %v", err)
+		}
+		if c.AllowedTargets != nil {
+			t.Errorf("AllowedTargets = %v, want nil (no enforcement)", c.AllowedTargets)
+		}
+	})
+
+	t.Run("allowed targets parsed sorted and deduplicated", func(t *testing.T) {
+		c := validCfg()
+		c.AllowedTargetsRaw = "west, east ,west,"
+		if err := c.Validate(); err != nil {
+			t.Fatalf("valid allow-list rejected: %v", err)
+		}
+		want := []string{"east", "west"}
+		if len(c.AllowedTargets) != 2 || c.AllowedTargets[0] != want[0] || c.AllowedTargets[1] != want[1] {
+			t.Errorf("AllowedTargets = %v, want %v", c.AllowedTargets, want)
+		}
+	})
+
+	malformedTargets := []struct {
+		name string
+		raw  string
+	}{
+		{name: "uppercase rejected", raw: "East"},
+		{name: "dot rejected (label, not subdomain)", raw: "east.lab"},
+		{name: "space inside entry rejected", raw: "east west"},
+		{name: "underscore rejected", raw: "spoke_a"},
+		{name: "leading hyphen rejected", raw: "-east"},
+		{name: "only commas rejected", raw: ",,,"},
+	}
+	for _, tc := range malformedTargets {
+		t.Run(tc.name, func(t *testing.T) {
+			c := validCfg()
+			c.AllowedTargetsRaw = tc.raw
+			err := c.Validate()
+			if err == nil || !strings.Contains(err.Error(), "--allowed-targets") {
+				t.Fatalf("want --allowed-targets validation error, got %v", err)
+			}
+		})
+	}
 }

@@ -58,6 +58,10 @@ spec:
             - --keycloak-client-id=REPLACE-ME
             - --hub-audience=REPLACE-ME
             - --target-header=X-Hub-Cluster
+            # Fail-fast target allow-list (comma-joined spoke names);
+            # empty (default) = no enforcement. MUST stay in sync with the
+            # gitops praxis-proxy chart's spokeGateways keys.
+            # - --allowed-targets=east,west
             - --run-agent=default
             # M3 bounds (design §2.3/§5.5/§6.4) — defaults mirror the
             # adapter's flag defaults.

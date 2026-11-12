@@ -150,6 +150,39 @@ rewrite the Secret.
   normal terminal path. A client that disconnects during a pause
   reattaches with `tasks/resubscribe`.
 
+### Target validation story (`--allowed-targets`)
+
+Who rejects a bad target cluster, in order of speed:
+
+1. **MAS orchestrator prompt (assist)**: the caller-facing prompt lists the
+   closed set of clusters, so the right target is chosen in the first place.
+   Advisory only — prompts are not enforcement.
+2. **Adapter fail-fast (`--allowed-targets`)**: comma-separated spoke names
+   (e.g. `east,west`). Empty (default) = no enforcement — any well-formed
+   target is accepted and the admission policy remains the only target
+   gate. When set, a fresh submit whose resolved target is not listed
+   fails BEFORE any AgenticRun or run-token Secret is created: the task is
+   parked adapter-terminally failed (same pre-create convention as the
+   expired-A path) with a self-correcting status message, e.g.
+   `unknown target "est"; available clusters: east, west`. The caller's
+   retry loop reads the message and re-sends on the same task with a
+   corrected target and a new messageId — the pre-submit record has no run
+   to be immutable about, and the original question is parked with it.
+   Entries must be single DNS labels (`run.IsDNSLabel`); a typo like
+   `East` or `east.lab` fails adapter startup, not a request later. This
+   is a UX/validation layer, NOT a security boundary.
+3. **Admission policy (hard gate)**: the kube API admission policy on
+   AgenticRun creation (design §4.3) is what actually enforces which
+   targets a caller may run against. The adapter's allow-list failing
+   fast just gives the caller an actionable error instead of a run that
+   dies at admission.
+4. **Praxis router allow-list**: the Praxis policy gateway in front of the
+   adapter only routes approved callers/paths to it at all — the outermost
+   ring of the same story.
+
+Hub-local runs (no target given) are not spoke targets and are not
+filtered by the allow-list.
+
 ## Layout
 
 ```
@@ -389,6 +422,8 @@ Reported, not worked around silently:
   spawn a run under it.
 - Multi-valued or conflicting target indicators are protocol errors, never
   OR-matched; renewal re-verifies the bound run's actual
-  `spec.targetCluster` (verify, don't trust).
+  `spec.targetCluster` (verify, don't trust). When `--allowed-targets` is
+  set, an unlisted target on a fresh submit fails before any CR or Secret
+  exists (validation layer only — the admission policy is the hard gate).
 - The adapter never writes conditions on AgenticRuns (§6.1) — the only
   resume-relevant write is the run-token Secret.

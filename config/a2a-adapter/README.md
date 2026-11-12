@@ -29,6 +29,7 @@ carry `REPLACE-ME` placeholders that MUST be patched before deploying:
 | `REPLACE-ME` | `--hub-audience` | audience requested on the exchanged hub token (Token H) |
 | `REPLACE-ME-keycloak-client-secret` | env `KEYCLOAK_CLIENT_SECRET` | Secret (key `client-secret`) holding the exchange client's secret |
 | `REPLACE-ME-praxis-namespace` | NetworkPolicy `namespaceSelector` | namespace running the Praxis policy gateway pods |
+| (commented out) | `--allowed-targets` | fail-fast allow-list of spoke names (comma-separated, e.g. `east,west`); empty (default) = no enforcement — the admission policy is the hard gate either way. MUST stay in sync with the gitops praxis-proxy chart's `spokeGateways` keys (and the lightspeed-hub chart's `adapter.allowedTargets`) |
 
 All other flags mirror the adapter's own defaults (`--listen=:8443`,
 `--target-header=X-Hub-Cluster`, M3 bounds: `--clock-skew=30s`,

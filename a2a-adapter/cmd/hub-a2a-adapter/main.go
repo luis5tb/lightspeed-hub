@@ -98,6 +98,7 @@ func mainRun() error {
 	handler, err := server.New(server.Config{
 		Namespace:            cfg.Namespace,
 		TargetHeader:         cfg.TargetHeader,
+		AllowedTargets:       cfg.AllowedTargets,
 		ClockSkew:            cfg.ClockSkew,
 		StreamDeadline:       cfg.StreamDeadline,
 		RenewalTimeout:       cfg.RenewalTimeout,

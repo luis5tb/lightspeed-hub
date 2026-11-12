@@ -8,8 +8,11 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
 	"time"
+
+	"github.com/openshift/lightspeed-hub/a2a-adapter/internal/run"
 )
 
 // requireHTTPS rejects non-https URLs on the credential-exchange endpoints.
@@ -58,6 +61,22 @@ type Config struct {
 	// TargetHeader is the hub-leg target transport header (design §4.2).
 	TargetHeader string
 
+	// AllowedTargetsRaw is the raw --allowed-targets flag value
+	// (comma-separated spoke names). Validate parses it into
+	// AllowedTargets; it is kept only so flag round-trips and error
+	// messages can quote what the operator actually passed.
+	AllowedTargetsRaw string
+
+	// AllowedTargets is the parsed, de-duplicated, sorted allow-list of
+	// spoke names. EMPTY = no allow-list enforcement: any well-formed
+	// target (per run.ResolveTarget's DNS-subdomain rule) is accepted
+	// and the admission policy on the kube API remains the only target
+	// gate. When non-empty, a fresh submit whose resolved target is not
+	// in the list fails fast BEFORE any AgenticRun or run-token Secret
+	// is created, with a status message naming the valid clusters so the
+	// caller loop can self-correct on its next message.
+	AllowedTargets []string
+
 	// RunAgent is spec.analysis.agent on created runs (the CRD requires
 	// the analysis step to be non-empty; "default" is the CRD's own
 	// documented default agent).
@@ -102,6 +121,7 @@ func (c *Config) AddFlags(fs *flag.FlagSet) {
 	fs.StringVar(&c.SVIDSocketPath, "svid-socket", envOr("SPIFFE_SOCKET", ""), "SPIFFE Workload API unix socket (SVID client-assertion mode; env SPIFFE_SOCKET)")
 	fs.StringVar(&c.HubAudience, "hub-audience", "", "requested audience for the exchanged hub token (Token H)")
 	fs.StringVar(&c.TargetHeader, "target-header", "X-Hub-Cluster", "inbound transport header carrying the target cluster (design §4.2)")
+	fs.StringVar(&c.AllowedTargetsRaw, "allowed-targets", "", "comma-separated allow-list of spoke (target cluster) names, e.g. east,west. Empty (default) = no allow-list enforcement: any well-formed target is accepted and the admission policy remains the hard gate; when set, a fresh submit with an unlisted target fails fast before any AgenticRun or run-token Secret is created")
 	fs.StringVar(&c.RunAgent, "run-agent", "default", "spec.analysis.agent on created AgenticRuns")
 	fs.StringVar(&c.WriterIdentity, "writer-identity", "", "value for the a2a.lightspeed.io/written-by provenance annotation (default: adapter-sa)")
 	fs.DurationVar(&c.ClockSkew, "clock-skew", 30*time.Second, "grace after exp in the pre-start Token A expiry check")
@@ -153,6 +173,33 @@ func (c *Config) Validate() error {
 	}
 	if c.WriterIdentity == "" {
 		c.WriterIdentity = "adapter-sa"
+	}
+
+	// Parse --allowed-targets into the sorted, de-duplicated allow-list.
+	// Entries must be single DNS labels (the shape a spoke name can
+	// take): a typo like "east west" or "East" must fail at startup, not
+	// silently never match. EMPTY stays empty — no enforcement, any
+	// well-formed target accepted (admission policy is the hard gate).
+	c.AllowedTargets = nil
+	if strings.TrimSpace(c.AllowedTargetsRaw) != "" {
+		seen := map[string]bool{}
+		for _, entry := range strings.Split(c.AllowedTargetsRaw, ",") {
+			entry = strings.TrimSpace(entry)
+			if entry == "" {
+				continue // tolerate trailing/doubled commas
+			}
+			if !run.IsDNSLabel(entry) {
+				return fmt.Errorf("--allowed-targets entry %q is not a valid DNS label (lowercase alphanumeric, internal hyphens, no dots)", entry)
+			}
+			if !seen[entry] {
+				seen[entry] = true
+				c.AllowedTargets = append(c.AllowedTargets, entry)
+			}
+		}
+		if len(c.AllowedTargets) == 0 {
+			return fmt.Errorf("--allowed-targets was set but contained no names")
+		}
+		sort.Strings(c.AllowedTargets)
 	}
 	return nil
 }

@@ -28,6 +28,19 @@ var (
 // (agenticrun_types.go:335): a DNS subdomain.
 var targetPattern = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`)
 
+// dnsLabelPattern is a single RFC 1123 DNS label (one dot-free segment of
+// the subdomain pattern above). Spoke names in the target allow-list are
+// single labels — cluster names, not FQDNs.
+var dnsLabelPattern = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`)
+
+// IsDNSLabel reports whether s is a single RFC 1123 DNS label: lowercase
+// alphanumeric with internal hyphens, no dots. Used by the adapter's
+// --allowed-targets validation so allow-list entries are exactly the shape
+// a spoke name can take.
+func IsDNSLabel(s string) bool {
+	return dnsLabelPattern.MatchString(s)
+}
+
 // ResolveTarget applies the deterministic target rules (design §4.2):
 //
 //   - headerValues: the inbound transport header (X-Hub-Cluster by

@@ -637,6 +637,118 @@ func TestTargetDuplicateHeaderValues(t *testing.T) {
 	}
 }
 
+// Target allow-list (--allowed-targets): fail-fast BEFORE any AgenticRun
+// or run-token Secret, with a self-correcting status message.
+func statusMessageText(t *testing.T, task map[string]any) string {
+	t.Helper()
+	status, _ := task["status"].(map[string]any)
+	message, _ := status["message"].(map[string]any)
+	parts, _ := message["parts"].([]any)
+	if len(parts) == 0 {
+		return ""
+	}
+	first, _ := parts[0].(map[string]any)
+	text, _ := first["text"].(string)
+	return text
+}
+
+func allowedListHarness(t *testing.T) *harness {
+	t.Helper()
+	return newHarnessWithConfig(t, func(c *Config) {
+		c.AllowedTargets = []string{"east", "west"}
+	})
+}
+
+func TestTargetAllowList(t *testing.T) {
+	t.Run("empty allow-list accepts any well-formed target", func(t *testing.T) {
+		h := newHarness(t) // default: no AllowedTargets
+		task := resultTask(t, sendMessage(t, h, userMessage("m1", "t1", "c1", "q",
+			map[string]any{"targetCluster": "some-unlisted-spoke"}), freshToken, nil))
+		if taskState(task) != "submitted" {
+			t.Fatalf("state = %q, want submitted (no enforcement by default)", taskState(task))
+		}
+		if h.kube.created != 1 {
+			t.Errorf("creates = %d, want 1", h.kube.created)
+		}
+	})
+
+	t.Run("listed target accepted", func(t *testing.T) {
+		h := allowedListHarness(t)
+		task := resultTask(t, sendMessage(t, h, userMessage("m1", "t1", "c1", "q",
+			map[string]any{"targetCluster": "east"}), freshToken, nil))
+		if taskState(task) != "submitted" {
+			t.Fatalf("state = %q, want submitted", taskState(task))
+		}
+		if h.kube.created != 1 || h.kube.secWritt != 1 {
+			t.Errorf("creates = %d, secret writes = %d; want 1/1", h.kube.created, h.kube.secWritt)
+		}
+	})
+
+	t.Run("unlisted target fails fast, no CR, no Secret, exact message", func(t *testing.T) {
+		h := allowedListHarness(t)
+		task := resultTask(t, sendMessage(t, h, userMessage("m1", "t1", "c1", "why is pod foo down?",
+			map[string]any{"targetCluster": "est"}), freshToken, nil))
+		if taskState(task) != "failed" {
+			t.Fatalf("state = %q, want failed", taskState(task))
+		}
+		want := `unknown target "est"; available clusters: east, west`
+		if got := statusMessageText(t, task); got != want {
+			t.Errorf("status message = %q, want %q", got, want)
+		}
+		if h.kube.created != 0 {
+			t.Errorf("AgenticRun creates = %d, want 0 (fail before creation)", h.kube.created)
+		}
+		if h.kube.secWritt != 0 {
+			t.Errorf("secret writes = %d, want 0 (no run-token Secret)", h.kube.secWritt)
+		}
+	})
+
+	t.Run("caller self-corrects on the next message with the parked question", func(t *testing.T) {
+		h := allowedListHarness(t)
+		sendMessage(t, h, userMessage("m1", "t1", "c1", "why is pod foo down?",
+			map[string]any{"targetCluster": "est"}), freshToken, nil)
+
+		// Next message, same task, corrected target: the pre-submit
+		// failure leaves nothing immutable, and the ORIGINAL question is
+		// the one submitted.
+		task := resultTask(t, sendMessage(t, h, userMessage("m2", "t1", "c1", "",
+			map[string]any{"targetCluster": "east"}), freshToken, nil))
+		if taskState(task) != "submitted" {
+			t.Fatalf("state = %q, want submitted after self-correction", taskState(task))
+		}
+		if h.kube.created != 1 {
+			t.Fatalf("creates = %d, want 1", h.kube.created)
+		}
+		runCR := h.kube.runByName(store.RunName("c1", "t1"))
+		if runCR.Spec.Request != "why is pod foo down?" {
+			t.Errorf("spec.request = %q, want the parked original question", runCR.Spec.Request)
+		}
+		if runCR.Spec.TargetCluster != "east" {
+			t.Errorf("spec.targetCluster = %q, want east", runCR.Spec.TargetCluster)
+		}
+	})
+
+	t.Run("parked auth-required record with a bad target fails at renewal, still no CR", func(t *testing.T) {
+		h := allowedListHarness(t)
+		// Expired A parks the task first (target unvalidated at park time).
+		sendMessage(t, h, userMessage("m1", "t1", "c1", "q",
+			map[string]any{"targetCluster": "est"}), expiredToken, nil)
+
+		task := resultTask(t, sendMessage(t, h, userMessage("m2", "t1", "c1", "",
+			map[string]any{"targetCluster": "est"}), freshToken, nil))
+		if taskState(task) != "failed" {
+			t.Fatalf("state = %q, want failed", taskState(task))
+		}
+		want := `unknown target "est"; available clusters: east, west`
+		if got := statusMessageText(t, task); got != want {
+			t.Errorf("status message = %q, want %q", got, want)
+		}
+		if h.kube.created != 0 || h.kube.secWritt != 0 {
+			t.Errorf("creates = %d, secret writes = %d; want 0/0", h.kube.created, h.kube.secWritt)
+		}
+	})
+}
+
 // Agent card served at the well-known path.
 func TestAgentCardServed(t *testing.T) {
 	h := newHarness(t)

@@ -119,3 +119,26 @@ func TestTruncateLabelValueMatchesRepoC(t *testing.T) {
 		t.Errorf("empty value changed: %q", got)
 	}
 }
+
+func TestIsDNSLabel(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"east", true},
+		{"spoke-1", true},
+		{"a", true},
+		{"", false},
+		{"East", false},      // uppercase is not a label
+		{"east.lab", false},  // subdomain, not a single label
+		{"east west", false}, // space (typo'd flag entry)
+		{"spoke_a", false},   // underscore
+		{"-east", false},     // leading hyphen
+		{"east-", false},     // trailing hyphen
+	}
+	for _, tc := range cases {
+		if got := IsDNSLabel(tc.in); got != tc.want {
+			t.Errorf("IsDNSLabel(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}

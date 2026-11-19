@@ -96,6 +96,14 @@ type Config struct {
 	TerminalCleanupGrace time.Duration // grace after terminal phase before the run-token Secret is deleted
 	SweepInterval        time.Duration // watcher sweeper cadence (deadlines + cleanup due-times)
 
+	// StartupRetryTimeout bounds how long startup (the recovery LIST +
+	// informer start) retries TRANSIENT API/storage errors — the CRD
+	// sync-wave race ("storage is (re)initializing") and flapping etcd —
+	// with exponential backoff, instead of crash-looping. 0 = fail fast
+	// (the pre-retry behavior, for tests). Non-transient errors (RBAC,
+	// bad config) always exit immediately regardless of this value.
+	StartupRetryTimeout time.Duration
+
 	// Agent card fields (design §2.1).
 	AgentName            string
 	AgentDescription     string
@@ -131,6 +139,7 @@ func (c *Config) AddFlags(fs *flag.FlagSet) {
 	fs.IntVar(&c.MaxPauses, "max-credential-pauses", 3, "total credential pauses per run before the task fails (design §6.4)")
 	fs.DurationVar(&c.TerminalCleanupGrace, "terminal-cleanup-grace", time.Minute, "grace after a terminal phase before ls-run-token-{runUID} is deleted (design §5.5)")
 	fs.DurationVar(&c.SweepInterval, "sweep-interval", 5*time.Second, "watcher sweeper cadence for pause deadlines and Secret cleanup")
+	fs.DurationVar(&c.StartupRetryTimeout, "startup-retry-timeout", 5*time.Minute, "how long startup (recovery LIST + informer start) retries transient API/storage errors (CRD storage still initializing, 503/504, timeouts, connection refused, flapping etcd) with exponential backoff before exiting; 0 = fail fast")
 
 	fs.StringVar(&c.AgentName, "card-name", "lightspeed-hub", "agent card name")
 	fs.StringVar(&c.AgentDescription, "card-description", "Red Hat cluster investigation via lightspeed-hub", "agent card description")
@@ -173,6 +182,9 @@ func (c *Config) Validate() error {
 	}
 	if c.WriterIdentity == "" {
 		c.WriterIdentity = "adapter-sa"
+	}
+	if c.StartupRetryTimeout < 0 {
+		return fmt.Errorf("--startup-retry-timeout must be >= 0 (0 = fail fast)")
 	}
 
 	// Parse --allowed-targets into the sorted, de-duplicated allow-list.

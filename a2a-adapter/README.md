@@ -183,6 +183,40 @@ Who rejects a bad target cluster, in order of speed:
 Hub-local runs (no target given) are not spoke targets and are not
 filtered by the allow-list.
 
+### Startup resilience (`--startup-retry-timeout`)
+
+**Live incident (the motivation, hard-won):** the adapter crash-looped
+fatally with
+
+```
+hub-adapter exiting: list agenticruns for recovery: storage is (re)initializing
+```
+
+The AgenticRun CRDs are applied at Argo sync-wave -1 while the adapter
+Deployment starts at wave 0, so the startup recovery LIST can race the
+API server finishing CRD storage establishment; the same 503 also
+appears when etcd flaps. Both are **transient** — exiting only widens
+the race window via CrashLoopBackOff. Nothing caught it sooner because
+every test fake answers the LIST immediately; the race only exists
+against a real API server with freshly-applied CRDs.
+
+Startup (the recovery LIST plus the informer start) now retries
+transient errors — `storage is (re)initializing`, HTTP 503/504, server
+timeouts, connection refused, deadline exceeded — with exponential
+backoff (2 s, doubling, capped at 30 s, jittered) for up to
+`--startup-retry-timeout` (default 5 m; `0` = fail fast, the old
+behavior, for tests). Each retry logs the error, attempt count, and
+next delay. Non-transient errors (Forbidden, NotFound, invalid config)
+exit immediately — retrying an RBAC mistake for five minutes would only
+hide it from the operator. On exhaustion the process exits with the
+ORIGINAL error, so the log says the real thing. The HTTP listener still
+only starts serving after successful recovery (unchanged order).
+Classification lives in `internal/server/retry.go`
+(`IsTransientAPIError`); the retry loop is `server.RetryTransient`,
+pinned by `internal/server/retry_test.go` with a flaky fake that fails
+the LIST N times with the incident's exact error before succeeding.
+
+
 ## Layout
 
 ```
@@ -198,6 +232,7 @@ a2a-adapter/                        (nested Go module — optional component)
 │   │                               #   projection (state+artifacts+usage), renewal + approval follow-ups
 │   ├── state.go                    # §7.2 phase mapping, terminal/credentials-expired predicates, status messages
 │   ├── watch.go                    # watch controller: pause bridge, pause deadlines, §5.5 cleanup, sweeper
+│   ├── retry.go                    # startup retry: transient API/storage errors (CRD sync-wave race, etcd flap)
 │   └── card.go                     # agent card from config + well-known route
 ├── internal/watch/ctrl.go          # controller-runtime informer glue (thin, no logic; feeds server.Watcher)
 ├── internal/store/store.go         # task/context/message records + per-task subscriber signals (deduped)

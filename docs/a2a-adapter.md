@@ -121,6 +121,27 @@ for the Red Hat Validated Pattern lives in the gitops repo's
 Hub-local runs (no target given) are not spoke targets and are not
 filtered by the allow-list.
 
+## Startup resilience (`--startup-retry-timeout`)
+
+**Live incident (the motivation):** the adapter crash-looped fatally
+with `hub-adapter exiting: list agenticruns for recovery: storage is
+(re)initializing`. The AgenticRun CRDs are applied at Argo sync-wave -1
+while the adapter Deployment starts at wave 0, so the startup recovery
+LIST can race the API server finishing CRD storage establishment; the
+same 503 appears when etcd flaps. Both are transient — exiting only
+widens the race window via CrashLoopBackOff.
+
+Startup (the recovery LIST plus the informer start) retries transient
+errors — `storage is (re)initializing`, HTTP 503/504, server timeouts,
+connection refused, deadline exceeded — with exponential backoff (2 s,
+doubling, capped at 30 s, jittered) for up to `--startup-retry-timeout`
+(default 5 m; `0` = fail fast). Each retry logs the error, attempt
+count, and next delay. Non-transient errors (Forbidden, NotFound,
+invalid config) exit immediately; on exhaustion the process exits with
+the original error. The HTTP listener still starts only after
+successful recovery. Details: `a2a-adapter/README.md` → "Startup
+resilience".
+
 ## Where things are
 
 | What | Where |

@@ -131,24 +131,43 @@ func mainRun() error {
 	// Restart recovery (design §2.3): rebuild task records from
 	// AgenticRun annotations before serving traffic. The M3 informers
 	// rehydrate anything this list misses as their caches sync.
-	ctx, cancel := context.WithCancel(context.Background())
+	//
+	// Startup retry: the recovery LIST (and the informer start below)
+	// can race the API server finishing CRD storage establishment —
+	// the CRDs apply at Argo sync-wave -1 and this Deployment starts at
+	// wave 0 — surfacing as "storage is (re)initializing" (503), or as
+	// 503/504/timeouts when etcd flaps. Those are transient: retry with
+	// exponential backoff for --startup-retry-timeout (default 5 m)
+	// instead of crash-looping. Non-transient errors (RBAC, invalid
+	// config) exit immediately.
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	if err := handler.Recover(ctx); err != nil {
-		return err
-	}
+	startup := func() error {
+		if err := handler.Recover(ctx); err != nil {
+			return err
+		}
 
-	// M3 watch wiring (design §7.1): informers on AgenticRun + Result CRs
-	// + AgenticRunApproval feed the watcher, which projects changes into
-	// the task store; the sweeper enforces the §6.4 pause deadlines and
-	// the §5.5 terminal-run Secret cleanup.
-	watcher, err := handler.NewWatcher()
-	if err != nil {
+		// M3 watch wiring (design §7.1): informers on AgenticRun +
+		// Result CRs + AgenticRunApproval feed the watcher, which
+		// projects changes into the task store; the sweeper enforces
+		// the §6.4 pause deadlines and the §5.5 terminal-run Secret
+		// cleanup.
+		watcher, err := handler.NewWatcher()
+		if err != nil {
+			return err
+		}
+		if err := kubeWatch.Start(ctx, restCfg, scheme, cfg.Namespace, watcher, logger); err != nil {
+			return fmt.Errorf("start informers: %w", err)
+		}
+		go watcher.Start(ctx)
+		return nil
+	}
+	if err := server.RetryTransient(ctx, server.RetryOptions{
+		Timeout: cfg.StartupRetryTimeout,
+		Logger:  logger,
+	}, startup); err != nil {
 		return err
 	}
-	if err := kubeWatch.Start(ctx, restCfg, scheme, cfg.Namespace, watcher, logger); err != nil {
-		return fmt.Errorf("start informers: %w", err)
-	}
-	go watcher.Start(ctx)
 
 	// HTTP surface: the agent card plus the JSON-RPC/SSE A2A endpoint.
 	// TLS serving is configured via --tls-cert-file/--tls-key-file (both
@@ -206,11 +225,9 @@ func mainRun() error {
 		errCh <- serve(ln, srv, cfg)
 	}()
 
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 	select {
-	case sig := <-stop:
-		logger.Info("shutting down", "signal", sig.String())
+	case <-ctx.Done():
+		logger.Info("shutting down")
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		return srv.Shutdown(shutdownCtx)

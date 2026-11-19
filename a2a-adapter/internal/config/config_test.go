@@ -3,6 +3,7 @@ package config
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 // validCfg is the baseline: every required field set, exchange client in
@@ -47,6 +48,21 @@ func TestValidate(t *testing.T) {
 		err := c.Validate()
 		if err == nil || !strings.Contains(err.Error(), "svid-socket") {
 			t.Fatalf("want exclusivity error naming --svid-socket, got %v", err)
+		}
+	})
+
+	// --startup-retry-timeout: 0 (fail fast) and the 5m default pass
+	// through; a negative value is a typo that must fail at startup.
+	t.Run("negative startup retry timeout rejected", func(t *testing.T) {
+		c := validCfg()
+		c.StartupRetryTimeout = -time.Second
+		err := c.Validate()
+		if err == nil || !strings.Contains(err.Error(), "startup-retry-timeout") {
+			t.Fatalf("want error naming --startup-retry-timeout, got %v", err)
+		}
+		c.StartupRetryTimeout = 0 // fail fast is legal
+		if err := c.Validate(); err != nil {
+			t.Fatalf("fail-fast (0) rejected: %v", err)
 		}
 	})
 

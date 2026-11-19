@@ -30,10 +30,12 @@ rules:
   # Approval DECISIONS are patched as the CALLER (Token H) — that
   # authorization is hub Authentication/RoleBinding wiring (keycloak-oidc
   # chart work in the gitops repo). The adapter SA itself only READS
-  # approvals (pending-stage derivation), so: get only.
+  # approvals (pending-stage derivation) AND the M3 informer watch
+  # (lists+watches them in the run namespace) -- get-only starves the
+  # informer and the adapter never binds its listener (live incident).
   - apiGroups: ["agentic.openshift.io"]
     resources: ["agenticrunapprovals"]
-    verbs: ["get"]
+    verbs: ["get", "list", "watch"]
   - apiGroups: ["agentic.openshift.io"]
     resources: ["analysisresults", "executionresults", "verificationresults", "escalationresults"]
     verbs: ["get", "list", "watch"]

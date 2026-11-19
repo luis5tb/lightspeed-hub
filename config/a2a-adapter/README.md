@@ -71,7 +71,9 @@ the run namespace per the design's §8.3 single-namespace shape):
   cleanup)
 - `agenticruns`: get/list/watch/update (the `update` covers exactly one
   write: the §6.4 pause-counter annotation; never status)
-- `agenticrunapprovals`: get (decisions are patched as the caller, Token H
+- `agenticrunapprovals`: get/list/watch (the SA reads approvals both
+  directly — pending-stage derivation — and via the M3 informer watch;
+  decisions are still patched as the caller, Token H
   — hub Authentication/RoleBinding wiring, not this Role)
 - result CRs (`analysisresults`, `executionresults`,
   `verificationresults`, `escalationresults`): get/list/watch

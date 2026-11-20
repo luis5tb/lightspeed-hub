@@ -87,6 +87,28 @@ func (HeaderSource) Credential(_ context.Context, r *http.Request) (*Credential,
 	}, nil
 }
 
+// HubTokenHeaderSource is HeaderSource for deployments where the Praxis hub
+// gateway in front of the adapter already exchanged the caller's Token A for
+// Token H (praxis-proxy a2aUpstream.exchangeAtPraxis): the inbound bearer IS
+// H. It is returned as TokenH (used directly for kube calls -- no A->H
+// exchange in the adapter) and as TokenA, the subject the run-token
+// exchanger turns into the run token R and the value the pre-start expiry
+// check and principal binding read. The adapter never sees the caller's
+// original token in this mode.
+type HubTokenHeaderSource struct{}
+
+var _ CredentialSource = HubTokenHeaderSource{}
+
+// Credential reads the Bearer token (Token H) and binds it like HeaderSource.
+func (HubTokenHeaderSource) Credential(ctx context.Context, r *http.Request) (*Credential, error) {
+	cred, err := HeaderSource{}.Credential(ctx, r)
+	if err != nil {
+		return nil, err
+	}
+	cred.TokenH = cred.TokenA
+	return cred, nil
+}
+
 func cutBearer(header string) (string, bool) {
 	prefix, token, found := strings.Cut(header, " ")
 	if !found || !strings.EqualFold(prefix, "Bearer") {

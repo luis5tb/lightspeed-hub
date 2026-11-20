@@ -346,6 +346,13 @@ func newHarnessWithConfig(t *testing.T, tune func(*Config)) *harness {
 // watcher, same API server state and same clock domain.
 func newHarnessSharing(t *testing.T, kube *fakeKube, clock *testClock, tune func(*Config)) *harness {
 	t.Helper()
+	return newHarnessFull(t, kube, clock, tune, nil)
+}
+
+// newHarnessFull is newHarnessSharing plus a hook to adjust Deps (e.g. a
+// RunTokenExchanger).
+func newHarnessFull(t *testing.T, kube *fakeKube, clock *testClock, tune func(*Config), tuneDeps func(*Deps)) *harness {
+	t.Helper()
 	cfg := Config{
 		Namespace:            "test-ns",
 		TargetHeader:         "X-Hub-Cluster",
@@ -360,7 +367,7 @@ func newHarnessSharing(t *testing.T, kube *fakeKube, clock *testClock, tune func
 	if tune != nil {
 		tune(&cfg)
 	}
-	handler, err := New(cfg, Deps{
+	deps := Deps{
 		Store:       store.New(),
 		Credentials: auth.HeaderSource{},
 		Exchanger:   stubExchanger{token: "token-h-value"},
@@ -369,7 +376,11 @@ func newHarnessSharing(t *testing.T, kube *fakeKube, clock *testClock, tune func
 		Submitters:  func(context.Context, string) (run.RunClient, error) { return kube, nil },
 		Runs:        &run.Creator{Namespace: "test-ns", AgentName: "default", WrittenBy: "adapter-sa"},
 		Tokens:      &run.TokenWriter{Secrets: kube, Namespace: "test-ns", Identity: "adapter-sa"},
-	})
+	}
+	if tuneDeps != nil {
+		tuneDeps(&deps)
+	}
+	handler, err := New(cfg, deps)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1059,5 +1070,33 @@ func TestTaskStateForPhases(t *testing.T) {
 	}}
 	if got := TaskStateFor(runCR); got != a2a.TaskStateCanceled {
 		t.Errorf("emergency-stopped = %v", got)
+	}
+}
+
+// With a RunTokenExchanger the run-token Secret carries the run token R
+// (exchange of A for the spoke gateway's audience), never the caller's raw
+// Token A: R outlives a short-lived A and is usable only at the spoke
+// gateway (docs: GATEWAY_MODE_SCOPED_TOKEN_EXCHANGE.md option 2). The
+// operator contract (name, key, labels) is unchanged.
+func TestRunTokenExchangerStoresRunToken(t *testing.T) {
+	h := newHarnessFull(t, newFakeKube(), &testClock{t: testNow}, nil, func(d *Deps) {
+		d.RunTokenExchanger = stubExchanger{token: "token-r-value"}
+	})
+	resultTask(t, sendMessage(t, h, userMessage("m1", "t1", "c1", "q",
+		map[string]any{"targetCluster": "spoke-a"}), freshToken, nil))
+
+	runCR := h.kube.runByName(store.RunName("c1", "t1"))
+	s := h.kube.secret(run.RunTokenSecretName(string(runCR.UID)))
+	if s == nil {
+		t.Fatal("run-token Secret not written")
+	}
+	if got := string(s.Data[run.RunTokenKey]); got != "token-r-value" {
+		if got == freshToken {
+			t.Fatal("run-token Secret holds the raw Token A, want the run token R")
+		}
+		t.Fatalf("run-token value = %q, want the run token R", got)
+	}
+	if s.Labels[run.LabelAgenticRun] != string(runCR.UID) || s.Labels[run.LabelSpokeCluster] != "spoke-a" {
+		t.Errorf("run-token labels changed: %v", s.Labels)
 	}
 }

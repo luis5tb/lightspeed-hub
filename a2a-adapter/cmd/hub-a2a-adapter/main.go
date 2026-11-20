@@ -94,6 +94,18 @@ func mainRun() error {
 	if err != nil {
 		return err
 	}
+	// Optional run-token exchanger (A -> R): same client and auth as the
+	// hub exchange, different requested audience. Nil = store Token A.
+	var runTokenExchanger auth.Exchanger
+	if cfg.RunTokenAudience != "" {
+		runCfg := exchangeCfg
+		runCfg.Audience = cfg.RunTokenAudience
+		rte, err := auth.NewTokenExchanger(runCfg)
+		if err != nil {
+			return err
+		}
+		runTokenExchanger = rte
+	}
 
 	handler, err := server.New(server.Config{
 		Namespace:            cfg.Namespace,
@@ -106,12 +118,13 @@ func mainRun() error {
 		TerminalCleanupGrace: cfg.TerminalCleanupGrace,
 		SweepInterval:        cfg.SweepInterval,
 	}, server.Deps{
-		Store:       store.New(),
-		Credentials: auth.HeaderSource{},
-		Exchanger:   exchanger,
-		Readers:     kube,
-		Results:     kube,
-		Submitters:  run.NewCtrlRunClientFactory(restCfg, scheme),
+		Store:             store.New(),
+		Credentials:       credentialSource(cfg.InboundHubToken),
+		Exchanger:         exchanger,
+		RunTokenExchanger: runTokenExchanger,
+		Readers:           kube,
+		Results:           kube,
+		Submitters:        run.NewCtrlRunClientFactory(restCfg, scheme),
 		Runs: &run.Creator{
 			Namespace: cfg.Namespace,
 			AgentName: cfg.RunAgent,
@@ -234,4 +247,14 @@ func mainRun() error {
 	case err := <-errCh:
 		return err
 	}
+}
+
+// credentialSource picks how the inbound bearer is read: Token A (the
+// adapter exchanges A->H itself) or, with --inbound-hub-token, Token H
+// already exchanged by the Praxis hub gateway.
+func credentialSource(inboundHubToken bool) auth.CredentialSource {
+	if inboundHubToken {
+		return auth.HubTokenHeaderSource{}
+	}
+	return auth.HeaderSource{}
 }

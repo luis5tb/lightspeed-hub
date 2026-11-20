@@ -54,8 +54,23 @@ func AgentCard(cfg CardConfig) *a2a.AgentCard {
 	}
 }
 
+// AgentCardPaths are the HTTP paths the agent card is served at.
+//
+// /.well-known/agent-card.json is the standard discovery path (design §2.1).
+// /a2a/.well-known/agent-card.json exists for the praxis-proxy pass-through
+// card: the public RPC URL is https://praxis-proxy.apps.<domain>/a2a, so A2A
+// clients resolve the card at {rpcUrl}/.well-known/agent-card.json, and the
+// pinned Praxis image has no path-rewrite filter, so it forwards that path
+// to the adapter unchanged. Serving the card here (rather than a static copy
+// in Praxis) keeps the advertised protocolVersion/capabilities in lockstep
+// with what this adapter actually implements.
+var AgentCardPaths = []string{
+	"/.well-known/agent-card.json",
+	"/a2a/.well-known/agent-card.json",
+}
+
 // ServeAgentCard returns an http.Handler serving the agent card JSON at
-// /.well-known/agent-card.json (design §2.1).
+// AgentCardPaths (design §2.1).
 func ServeAgentCard(card *a2a.AgentCard) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

@@ -395,10 +395,13 @@ func newHarnessSharing(t *testing.T, kube *fakeKube, clock *testClock, tune func
 
 	mux := http.NewServeMux()
 	mux.Handle("/healthz", HealthHandler())
-	mux.Handle("/.well-known/agent-card.json", ServeAgentCard(AgentCard(CardConfig{
+	cardHandler := ServeAgentCard(AgentCard(CardConfig{
 		Name: "lightspeed-hub", URL: "https://praxis/hub-adapter", Version: "0.1.0",
 		SkillID: "cluster-investigation", SkillName: "investigate",
-	})))
+	}))
+	for _, p := range AgentCardPaths {
+		mux.Handle(p, cardHandler)
+	}
 	mux.Handle("/", WithRequestCapture(a2asrv.NewJSONRPCHandler(handler)))
 
 	srv := httptest.NewServer(mux)
@@ -749,27 +752,43 @@ func TestTargetAllowList(t *testing.T) {
 	})
 }
 
-// Agent card served at the well-known path.
+// Agent card served at every well-known path, including the /a2a-prefixed
+// one praxis-proxy's pass-through route forwards unchanged.
 func TestAgentCardServed(t *testing.T) {
 	h := newHarness(t)
-	resp, err := http.Get(h.server.URL + "/.well-known/agent-card.json")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d", resp.StatusCode)
-	}
-	var card map[string]any
-	if err := json.NewDecoder(resp.Body).Decode(&card); err != nil {
-		t.Fatal(err)
-	}
-	if card["name"] != "lightspeed-hub" {
-		t.Errorf("card name = %v", card["name"])
-	}
-	caps, _ := card["capabilities"].(map[string]any)
-	if caps["streaming"] != true {
-		t.Errorf("capabilities = %v, want streaming=true", caps)
+	for _, path := range []string{"/.well-known/agent-card.json", "/a2a/.well-known/agent-card.json"} {
+		t.Run(path, func(t *testing.T) {
+			resp, err := http.Get(h.server.URL + path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d", resp.StatusCode)
+			}
+			var card map[string]any
+			if err := json.NewDecoder(resp.Body).Decode(&card); err != nil {
+				t.Fatal(err)
+			}
+			if card["name"] != "lightspeed-hub" {
+				t.Errorf("card name = %v", card["name"])
+			}
+			// Clients pick their transport from this card: protocolVersion
+			// must stay 0.3.x (the a2a-go v0.3 server only speaks
+			// message/send|stream) and url must be non-empty (a2a-sdk only
+			// maps a legacy card's protocolVersion onto an interface when
+			// url is set).
+			if card["protocolVersion"] != "0.3.0" {
+				t.Errorf("protocolVersion = %v, want 0.3.0", card["protocolVersion"])
+			}
+			if s, _ := card["url"].(string); s == "" {
+				t.Errorf("url is empty")
+			}
+			caps, _ := card["capabilities"].(map[string]any)
+			if caps["streaming"] != true {
+				t.Errorf("capabilities = %v, want streaming=true", caps)
+			}
+		})
 	}
 }
 

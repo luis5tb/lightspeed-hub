@@ -180,7 +180,7 @@ func mainRun() error {
 	// Service is internal-only behind the NetworkPolicy (Praxis-namespace
 	// ingress); probes must not need a token.
 	mux.Handle("/healthz", server.HealthHandler())
-	mux.Handle("/.well-known/agent-card.json", server.ServeAgentCard(server.AgentCard(server.CardConfig{
+	cardHandler := server.ServeAgentCard(server.AgentCard(server.CardConfig{
 		Name:             cfg.AgentName,
 		Description:      cfg.AgentDescription,
 		URL:              cfg.AgentURL,
@@ -190,7 +190,12 @@ func mainRun() error {
 		SkillName:        cfg.SkillName,
 		SkillDescription: cfg.SkillDescription,
 		Tags:             cfg.SkillTags,
-	})))
+	}))
+	// Unauthenticated, like /healthz: the card is public discovery data.
+	// See server.AgentCardPaths for why it is served under /a2a too.
+	for _, p := range server.AgentCardPaths {
+		mux.Handle(p, cardHandler)
+	}
 	mux.Handle("/", server.WithRequestCapture(a2asrv.NewJSONRPCHandler(handler, a2asrv.WithKeepAlive(30*time.Second))))
 
 	srv := &http.Server{

@@ -88,6 +88,14 @@ type Deps struct {
 	// not (adapter-fallback placement, design §3.2). Nil means the source
 	// must supply TokenH itself (future Praxis-side placement).
 	Exchanger auth.Exchanger
+	// RunTokenExchanger, when non-nil, exchanges Token A for the RUN TOKEN
+	// R that is written to the run-token Secret (initial submit and
+	// renewal) instead of Token A itself. R's audience is the spoke
+	// gateway's exchanger and its lifespan the exchange client's, so a
+	// short-lived A does not cut an AgenticRun step short and the stored
+	// credential is unusable anywhere but the spoke gateway. Nil keeps
+	// storing Token A (the original contract).
+	RunTokenExchanger auth.Exchanger
 	// Readers reads AgenticRuns as the ADAPTER SA (RBAC §8.1:
 	// get/list/watch in the run namespace). Used for tasks/get,
 	// projections, and restart recovery.
@@ -219,6 +227,30 @@ func (h *Handler) tokenH(ctx context.Context, cred *auth.Credential) (string, er
 		return "", fmt.Errorf("%w: %v", a2a.ErrInternalError, err)
 	}
 	return tokenH, nil
+}
+
+// runCredential returns the credential to store in the run-token Secret:
+// Token A itself, or -- when a RunTokenExchanger is configured -- the run
+// token R exchanged from it. Exchange failures map like tokenH's. The
+// returned value must never be logged.
+func (h *Handler) runCredential(ctx context.Context, cred *auth.Credential) (string, error) {
+	if h.deps.RunTokenExchanger == nil {
+		return cred.TokenA, nil
+	}
+	tokenR, err := h.deps.RunTokenExchanger.Exchange(ctx, cred.TokenA)
+	if err != nil {
+		var xe *auth.ExchangeError
+		if errors.As(err, &xe) {
+			switch xe.Kind {
+			case auth.ErrorKindInvalidGrant:
+				return "", fmt.Errorf("%w: subject token rejected by run-token exchange", a2a.ErrUnauthenticated)
+			case auth.ErrorKindInvalidClient, auth.ErrorKindDenied:
+				return "", fmt.Errorf("%w: run-token exchange: %v", a2a.ErrUnauthorized, err)
+			}
+		}
+		return "", fmt.Errorf("%w: run-token exchange: %v", a2a.ErrInternalError, err)
+	}
+	return tokenR, nil
 }
 
 // ---- message parsing helpers -----------------------------------------------
@@ -852,8 +884,13 @@ func (h *Handler) handleSend(ctx context.Context, params *a2a.MessageSendParams)
 
 	// Write the run-token Secret immediately after CR creation (design
 	// §5.4): the name needs the server-assigned UID; the common path
-	// never pauses.
-	if err := h.deps.Tokens.Write(ctx, submitted, cred.TokenA); err != nil {
+	// never pauses. The stored credential is Token A or, with a
+	// RunTokenExchanger, the run token R (see runCredential).
+	runCred, err := h.runCredential(ctx, cred)
+	if err != nil {
+		return nil, err
+	}
+	if err := h.deps.Tokens.Write(ctx, submitted, runCred); err != nil {
 		return nil, fmt.Errorf("%w: %v", a2a.ErrInternalError, err)
 	}
 
@@ -995,8 +1032,13 @@ func (h *Handler) handleFollowUp(ctx context.Context, rec *store.TaskRecord, msg
 	// Renewal (§6.1 step 5): rewrite token-a with fresh A. Labels are
 	// untouched (run/token.go); the resourceVersion change is repo C's
 	// resume signal (it re-attempts the paused step within its 30 s
-	// requeue — gateway-credential-mode.md "Resume latency").
-	if err := h.deps.Tokens.Write(ctx, runCR, cred.TokenA); err != nil {
+	// requeue — gateway-credential-mode.md "Resume latency"). With a
+	// RunTokenExchanger the fresh A is exchanged into a fresh R first.
+	runCred, err := h.runCredential(ctx, cred)
+	if err != nil {
+		return nil, err
+	}
+	if err := h.deps.Tokens.Write(ctx, runCR, runCred); err != nil {
 		return nil, fmt.Errorf("%w: %v", a2a.ErrInternalError, err)
 	}
 	rec.AuthPaused = false

@@ -58,6 +58,20 @@ type Config struct {
 	// HubAudience is the audience requested on Token H.
 	HubAudience string
 
+	// RunTokenAudience, when set, makes the adapter store a RUN TOKEN R in
+	// the run-token Secret instead of the caller's raw Token A: R is the
+	// exchange of A for this audience (the spoke gateway's exchanger client,
+	// e.g. praxis-spoke-gateway). R's lifespan is the exchange client's
+	// access-token lifespan, so it can outlive a short-lived A and cover a
+	// whole AgenticRun step, and it is usable only at the spoke gateway.
+	// Empty (default) keeps storing Token A.
+	RunTokenAudience string
+
+	// InboundHubToken: the inbound bearer is already Token H (the Praxis hub
+	// gateway exchanged A->H). The adapter uses it directly to create runs
+	// and, with RunTokenAudience, exchanges it (not A) into the run token R.
+	InboundHubToken bool
+
 	// TargetHeader is the hub-leg target transport header (design §4.2).
 	TargetHeader string
 
@@ -128,6 +142,8 @@ func (c *Config) AddFlags(fs *flag.FlagSet) {
 	fs.StringVar(&c.KeycloakClientSecret, "keycloak-client-secret", envOr("KEYCLOAK_CLIENT_SECRET", ""), "confidential exchange client secret (env KEYCLOAK_CLIENT_SECRET)")
 	fs.StringVar(&c.SVIDSocketPath, "svid-socket", envOr("SPIFFE_SOCKET", ""), "SPIFFE Workload API unix socket (SVID client-assertion mode; env SPIFFE_SOCKET)")
 	fs.StringVar(&c.HubAudience, "hub-audience", "", "requested audience for the exchanged hub token (Token H)")
+	fs.StringVar(&c.RunTokenAudience, "run-token-audience", "", "when set, store a run token R (exchange of the inbound token for this audience, e.g. the spoke gateway's exchanger client) in the run-token Secret instead of the inbound token; empty = store it as-is")
+	fs.BoolVar(&c.InboundHubToken, "inbound-hub-token", false, "the inbound bearer is already Token H (exchanged by the Praxis hub gateway): use it directly for kube calls, no A->H exchange in the adapter")
 	fs.StringVar(&c.TargetHeader, "target-header", "X-Hub-Cluster", "inbound transport header carrying the target cluster (design §4.2)")
 	fs.StringVar(&c.AllowedTargetsRaw, "allowed-targets", "", "comma-separated allow-list of spoke (target cluster) names, e.g. east,west. Empty (default) = no allow-list enforcement: any well-formed target is accepted and the admission policy remains the hard gate; when set, a fresh submit with an unlisted target fails fast before any AgenticRun or run-token Secret is created")
 	fs.StringVar(&c.RunAgent, "run-agent", "default", "spec.analysis.agent on created AgenticRuns")

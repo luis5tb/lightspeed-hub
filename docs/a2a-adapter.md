@@ -149,5 +149,5 @@ resilience".
 | Adapter source | `a2a-adapter/` (nested module; `cmd/hub-a2a-adapter/`, `internal/{auth,config,run,server,store,watch}/`) |
 | Adapter README (built surface, decisions, security invariants) | `a2a-adapter/README.md` |
 | Deployment component | `config/a2a-adapter/` |
-| Container image | `Dockerfile`, target `a2a-adapter` (UBI9 go-toolset, `strictfipsruntime`, mirroring the operator image) |
+| Container image | `Dockerfile`, target `a2a-adapter` (UBI9 go-toolset builder, native Go FIPS 140-3, ubi9-micro runtime — mirroring the operator image) |
 | Design doc (authoritative) | gitops repo, `docs/LIGHTSPEED_HUB_ADAPTER_DESIGN.md` |

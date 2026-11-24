@@ -154,7 +154,7 @@ A2A_ADAPTER_IMG ?= lightspeed-hub-a2a-adapter:$(VERSION)
 
 .PHONY: build-a2a-adapter
 build-a2a-adapter: ## Build the A2A adapter binary (a2a-adapter nested module).
-	cd a2a-adapter && go build -o ../bin/hub-a2a-adapter ./cmd/hub-a2a-adapter
+	cd a2a-adapter && GOFIPS140=certified go build -o ../bin/hub-a2a-adapter ./cmd/hub-a2a-adapter
 
 .PHONY: fmt-a2a-adapter
 fmt-a2a-adapter: ## Verify gofmt produces no changes in the A2A adapter nested module.
@@ -176,6 +176,9 @@ image-a2a-adapter: ## Build the A2A adapter container image (vendors deps into a
 	rm -rf .a2a-image-context
 	mkdir -p .a2a-image-context
 	cp -r a2a-adapter .a2a-image-context/a2a-adapter
+	# Stage the ISA-level checker (root module, stdlib-only) into the
+	# adapter's module tree so the image build can run it; see Dockerfile.
+	cp -r cmd/check-isa-level .a2a-image-context/a2a-adapter/cmd/check-isa-level
 	cp LICENSE .a2a-image-context/
 	# Vendor from the real module dir (the sibling replace must resolve),
 	# then move vendor/ into the staging copy so no vendor tree stays in

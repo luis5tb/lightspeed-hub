@@ -56,6 +56,10 @@ func mainRun() error {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	slog.SetDefault(logger)
 
+	// Startup assertion (mirrors the operator's cmd/fips.go): refuse to run
+	// without FIPS-approved crypto when the host is in FIPS mode.
+	checkFIPSMode(logger.Info)
+
 	// Kubernetes clients. The adapter SA reads runs/secrets; run CREATION
 	// happens as the caller (Token H) via the per-request factory.
 	restCfg, err := rest.InClusterConfig()

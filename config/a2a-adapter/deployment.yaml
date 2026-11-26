@@ -15,7 +15,12 @@ metadata:
     app.kubernetes.io/component: a2a-adapter
     app.kubernetes.io/part-of: lightspeed-hub
 spec:
+  # Approval/revision and execution-credential coordination is process-local.
   replicas: 1
+  # Prevent an old and new adapter from overlapping: its keyed run mutex is
+  # not distributed, and overlap can race credential preparation/reconciliation.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: lightspeed-hub-a2a-adapter
@@ -63,6 +68,13 @@ spec:
             # gitops praxis-proxy chart's spokeGateways keys.
             # - --allowed-targets=east,west
             - --run-agent=default
+            # Optional scoped spoke credentials. The run token is the
+            # reader credential; execution credentials are minted only
+            # after the caller approves Execution. When enabling execution
+            # tokens, set BOTH audience flags (or set
+            # EXECUTION_TOKEN_AUDIENCE in the environment).
+            # - --run-token-audience=REPLACE-ME-spoke-reader-audience
+            # - --execution-token-audience=REPLACE-ME-spoke-execution-audience
             # M3 bounds (design §2.3/§5.5/§6.4) — defaults mirror the
             # adapter's flag defaults.
             - --clock-skew=30s

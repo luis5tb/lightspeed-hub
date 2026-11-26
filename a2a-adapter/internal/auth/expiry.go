@@ -51,6 +51,42 @@ func UnverifiedClaims(token string) (map[string]any, error) {
 	return claims, nil
 }
 
+// TokenAudiences returns the JWT aud claim as a slice, accepting both the
+// string and string-array forms permitted by JWT. This is an unverified
+// inspection only; callers must not treat it as signature validation.
+func TokenAudiences(token string) ([]string, error) {
+	claims, err := UnverifiedClaims(token)
+	if err != nil {
+		return nil, err
+	}
+	raw, ok := claims["aud"]
+	if !ok {
+		return nil, fmt.Errorf("%w: missing aud claim", ErrMalformedToken)
+	}
+	switch aud := raw.(type) {
+	case string:
+		if aud == "" {
+			return nil, fmt.Errorf("%w: empty aud claim", ErrMalformedToken)
+		}
+		return []string{aud}, nil
+	case []any:
+		if len(aud) == 0 {
+			return nil, fmt.Errorf("%w: empty aud array", ErrMalformedToken)
+		}
+		out := make([]string, 0, len(aud))
+		for i, item := range aud {
+			value, ok := item.(string)
+			if !ok || value == "" {
+				return nil, fmt.Errorf("%w: aud array item %d is not a non-empty string", ErrMalformedToken, i)
+			}
+			out = append(out, value)
+		}
+		return out, nil
+	default:
+		return nil, fmt.Errorf("%w: aud claim is %T, not a string or string array", ErrMalformedToken, raw)
+	}
+}
+
 // TokenExpiry returns the exp claim as a time.Time. It performs NO signature
 // validation (see UnverifiedClaims).
 func TokenExpiry(token string) (time.Time, error) {

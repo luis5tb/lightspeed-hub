@@ -10,13 +10,12 @@ import (
 )
 
 // RunClient is the adapter's narrow interface over the AgenticRun and
-// AgenticRunApproval APIs. Read operations (Get/List) are exercised with
-// the ADAPTER'S service account; Create/Update (including approval
-// decisions, which repo C's mutating admission webhook attributes to the
-// request user) are exercised AS THE CALLER (Token H) so runs and approval
-// decisions are attributable to the requester, never to the adapter
-// (design §3.3, §7.1). RBAC notes for the chart (M4) are in the
-// hub-adapter README.
+// AgenticRunApproval APIs. The reader client is the adapter SA and performs
+// reads, same-run revision writes, and adapter-owned annotation updates after
+// ownership checks. The per-request caller client (Token H) performs run
+// creation and approval decisions, preserving caller attribution at repo C's
+// admission webhook (design §3.3, §7.1). RBAC notes for the chart (M4) are
+// in the hub-adapter README.
 type RunClient interface {
 	CreateRun(ctx context.Context, run *agenticv1alpha1.AgenticRun) error
 	GetRun(ctx context.Context, namespace, name string) (*agenticv1alpha1.AgenticRun, error)
@@ -55,5 +54,5 @@ type SecretClient interface {
 
 // RunClientFactory builds a per-request RunClient authenticated as the
 // caller via Token H (never the adapter SA). The returned client is used
-// for CreateRun/UpdateRun/UpdateApproval on that request only.
+// for CreateRun and UpdateApproval on that request only.
 type RunClientFactory func(ctx context.Context, tokenH string) (RunClient, error)

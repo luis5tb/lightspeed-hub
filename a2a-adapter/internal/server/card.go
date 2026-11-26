@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 
 	"github.com/a2aproject/a2a-go/a2a"
 )
@@ -10,7 +11,7 @@ import (
 // CardConfig holds the agent-card fields derived from deployment config
 // (design §2.1). The card advertises one skill — Red Hat cluster
 // investigation via lightspeed-hub — text input, text + structured output,
-// and streaming support.
+// streaming support, and an approval checkpoint before cluster changes.
 type CardConfig struct {
 	Name             string
 	Description      string
@@ -29,9 +30,12 @@ func AgentCard(cfg CardConfig) *a2a.AgentCard {
 	if protocolVersion == "" {
 		protocolVersion = "0.3.0"
 	}
+	const checkpoint = "Runs end at an approval checkpoint (input-required with an approvalRequest DataPart) before any cluster change."
+	description := appendApprovalCheckpoint(cfg.Description, checkpoint)
+	skillDescription := appendApprovalCheckpoint(cfg.SkillDescription, checkpoint)
 	return &a2a.AgentCard{
 		Name:               cfg.Name,
-		Description:        cfg.Description,
+		Description:        description,
 		URL:                cfg.URL,
 		Version:            cfg.Version,
 		ProtocolVersion:    protocolVersion,
@@ -47,11 +51,21 @@ func AgentCard(cfg CardConfig) *a2a.AgentCard {
 			{
 				ID:          cfg.SkillID,
 				Name:        cfg.SkillName,
-				Description: cfg.SkillDescription,
+				Description: skillDescription,
 				Tags:        cfg.Tags,
 			},
 		},
 	}
+}
+
+func appendApprovalCheckpoint(description, checkpoint string) string {
+	if strings.Contains(description, "input-required with an approvalRequest DataPart") {
+		return description
+	}
+	if description == "" {
+		return checkpoint
+	}
+	return description + " " + checkpoint
 }
 
 // AgentCardPaths are the HTTP paths the agent card is served at.

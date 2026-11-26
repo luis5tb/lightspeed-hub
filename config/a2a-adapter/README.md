@@ -30,6 +30,8 @@ carry `REPLACE-ME` placeholders that MUST be patched before deploying:
 | `REPLACE-ME-keycloak-client-secret` | env `KEYCLOAK_CLIENT_SECRET` | Secret (key `client-secret`) holding the exchange client's secret |
 | `REPLACE-ME-praxis-namespace` | NetworkPolicy `namespaceSelector` | namespace running the Praxis policy gateway pods |
 | (commented out) | `--allowed-targets` | fail-fast allow-list of spoke names (comma-separated, e.g. `east,west`); empty (default) = no enforcement — the admission policy is the hard gate either way. MUST stay in sync with the gitops praxis-proxy chart's `spokeGateways` keys (and the lightspeed-hub chart's `adapter.allowedTargets`) |
+| (commented out) | `--run-token-audience` | optional reader-token audience; required to enable the execution-token split |
+| (commented out) | `--execution-token-audience` / env `EXECUTION_TOKEN_AUDIENCE` | optional execution-only token audience; when non-empty, `--run-token-audience` is required |
 
 All other flags mirror the adapter's own defaults (`--listen=:8443`,
 `--target-header=X-Hub-Cluster`, M3 bounds: `--clock-skew=30s`,
@@ -37,6 +39,22 @@ All other flags mirror the adapter's own defaults (`--listen=:8443`,
 `--max-credential-pauses=3`, `--terminal-cleanup-grace=1m`,
 `--sweep-interval=5s`, card flags per the config source). `--namespace`
 is left at its default: the pod's own namespace.
+
+The Deployment is deliberately **one replica with `Recreate` strategy**.
+Approval, revision, and execution-token reconciliation use a process-local,
+per-run mutex; RollingUpdate can overlap two adapters and let one delete
+`token-execution` while the other is preparing it before approval commits.
+The reconciler also honors a two-minute execution-token preparation grace
+unless the run is terminal or Execution has finished. Keep both the replica
+count and strategy until coordination is replaced with a distributed
+mechanism.
+
+The deployment example leaves both run-token audience flags commented out
+(legacy credential behavior). To enable the per-step token split, patch both
+audiences: `token-a` is exchanged for the reader gateway, while
+`token-execution` is minted only on an Execution approval and removed as
+soon as execution finishes. The adapter rejects
+`--execution-token-audience` without `--run-token-audience` at startup.
 
 ## TLS on 8443 (service-serving cert)
 
@@ -69,15 +87,21 @@ the run namespace per the design's §8.3 single-namespace shape):
 
 - `secrets`: create/get/update/delete (run-token writer + §5.5 terminal
   cleanup)
-- `agenticruns`: get/list/watch/update (the `update` covers exactly one
-  write: the §6.4 pause-counter annotation; never status)
-- `agenticrunapprovals`: get/list/watch (the SA reads approvals both
-  directly — pending-stage derivation — and via the M3 informer watch;
-  decisions are still patched as the caller, Token H
-  — hub Authentication/RoleBinding wiring, not this Role)
+- `agenticruns`: get/list/watch/update (annotation bookkeeping, revision
+  feedback, and approved-analysis/revision attribution; never status). The
+  existing list/get grants also support durable execution-token cleanup,
+  without Secret `list` permission.
+- `agenticrunapprovals`: get/list/watch for the adapter SA (approval-state
+  derivation/reconciliation and informer watch). Separately, the caller's hub-authenticated
+  group needs **get + update** on `agenticrunapprovals` in the run namespace:
+  the adapter reads the approval as its SA, then patches the decision as the
+  caller (Token H) so the admission webhook attributes the real approver.
+  That caller-group grant is in hub Authentication/RoleBinding wiring, not
+  this adapter Role.
 - result CRs (`analysisresults`, `executionresults`,
   `verificationresults`, `escalationresults`): get/list/watch
 
-Run CREATION is authorized as the caller (Token H): the hub
-Authentication/RoleBinding wiring that lets H-authenticated principals
-create agenticruns and decide approvals is external to this component.
+Run creation and approval decisions are authorized as the caller (Token H):
+the hub Authentication/RoleBinding wiring that lets H-authenticated
+principals create agenticruns and get/update agenticrunapprovals is external
+to this component.

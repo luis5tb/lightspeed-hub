@@ -37,7 +37,8 @@ the design left freedom, and what is explicitly deferred to M4/M5.
 - **Protected Token A handoff interface** (design §3.3):
   `auth.CredentialSource` with `HeaderSource` (adapter-fallback) and a
   documented placeholder for the Praxis-side protected channel.
-- **Message → CR mapping** (design §4): analysis-only runs, text parts →
+- **Message → CR mapping** (design §4): every run has analysis, execution,
+  and verification steps (same configured `--run-agent`); text parts →
   `spec.request`, principal annotation, deterministic target rules (§4.2:
   structured data only, duplicates/conflicts rejected), `revisionFeedback`
   as the `revise` DataPart follow-up.
@@ -61,11 +62,12 @@ the design left freedom, and what is explicitly deferred to M4/M5.
   gone). Watch drop/reconnect is the informer's relist; projections are
   idempotent and the store dedupes unchanged projections, so a reconnect
   neither duplicates nor loses task updates (tested).
-- **Full §7.2 phase mapping**: Pending→submitted;
+- **Phase mapping**: Pending→submitted;
   Analyzing/Executing/Verifying/Escalating→working; Proposed→
-  **input-required** (with the approval-decision DataPart below);
+  **input-required** (human TextPart + `approvalRequest` DataPart below);
   Completed→completed; Failed/Denied/Escalated→failed (condition
-  reason/message surfaced as the status message); EmergencyStopped→canceled;
+  reason/message surfaced), except Execution denial after successful
+  analysis, which completes with the analysis artifact; EmergencyStopped→canceled;
   Stopping→canceled; the auth-required pause is a record-side overlay on
   the existing task (CredentialsExpired does not participate in
   DerivePhase, per repo C's contract). Artifacts: one per step kind from
@@ -75,19 +77,58 @@ the design left freedom, and what is explicitly deferred to M4/M5.
   `tokenUsage` when Result CRs expose it.
 - **Approval surface** (design §7.1): a pending approval surfaces
   `input-required` naming the pending stage (derived from the run's
-  AgenticRunApproval: first workflow stage absent from `spec.stages`).
-  The decision is a DataPart on the same task, new messageId:
+  AgenticRunApproval: first workflow stage absent from `spec.stages`). The
+  status message has a human TextPart and a DataPart carrying the
+  `approvalRequest` contract below. `message/send` returns this task
+  immediately. `message/stream` emits the input-required status update with
+  `Final: true` and ends (the task remains resumable). A decision follow-up
+  on `message/stream` waits past the unchanged Proposed phase and streams the
+  continued run until terminal or another checkpoint. Auth-required retains
+  its existing renewal-bound stream behavior. The decision is a DataPart on
+  the same task, new messageId:
   `{"approve":{"stage":"Execution","option":0}}` or
   `{"reject":{"stage":"..."}}` — forwarded to the AgenticRunApproval CR
   **as the caller** (Token H), so repo C's mutating admission webhook
-  stamps the true approver. Idempotent per stage; conflicting re-decisions
-  are left to the CRD's immutability to reject.
+  stamps the true approver. Approval, rejection, and revision commands are
+  mutually exclusive within one message and validated before writes. Idempotent
+  replays are per stage; conflicting re-decisions are rejected without changing
+  credentials or approval state.
+- **Approval-gated workflow**: cluster policy is expected to configure
+  Analysis=Automatic, Execution=Manual, Verification=Automatic, and
+  Escalation=Automatic. The adapter always creates all three run steps;
+  the operator parks at Proposed until Execution receives an approval
+  stage. The cross-service request shape is:
+
+  ```json
+  {"approvalRequest":{"stage":"Execution","run":"a2a-...","targetCluster":"east","options":[{"index":0,"number":1,"title":"Restart the service","summary":"Restart the workload safely."}],"decisions":["approve","reject"]}}
+  ```
+
+  Option `index` is the operator's zero-based ExecutionApproval index;
+  `number` is the corresponding human one-based choice. Options are read in
+  order from the newest successful `AnalysisResult.Status.Options`; `title`
+  and `summary` map directly from each option, with `summary` truncated to
+  500 Unicode runes. An unavailable or unreadable AnalysisResult produces
+  an empty options list. Approval follow-ups carry a DataPart on the same
+  task with a new messageId, e.g. `{"approve":{"stage":"Execution","option":0}}`
+  or `{"reject":{"stage":"Execution"}}`. The option value is the
+  zero-based `index`, not the displayed `number`.
+- **Per-step spoke credentials** (optional): `--run-token-audience` mints
+  the reader-only run token R stored under `token-a`. When
+  `--execution-token-audience` is set, approving Execution first writes a
+  fresh R and an execution-only `token-execution` into the same Secret,
+  then patches the approval as the caller. The execution key is removed
+  once execution finishes; `token-a` stays for verification and terminal
+  grace cleanup. Empty execution audience keeps the legacy behavior.
 - **Renewal bridge** (design §6, the core — M3): see below.
 - **Terminal-run Secret cleanup** (design §5.5, M3): when a run reaches a
   terminal phase, `ls-run-token-{runUID}` is deleted (never blanked) after
   a configurable grace period (default 60 s); a terminal→non-terminal
-  revision re-open within the grace cancels the deletion; a deleted run's
-  Secret goes too (the adapter-written Secret carries no owner ref).
+  revision re-open within the grace cancels the deletion. The delayed delete
+  re-reads the current run under its per-run lock and requires the same UID,
+  task binding, terminal state, run generation, and analysis generation; a
+  transient read/delete failure retains a retry schedule. A deleted run's
+  Secret is also tied to its AgenticRun by a non-controller, non-blocking
+  owner reference, so Kubernetes garbage collection covers run deletion.
 
 ### The renewal bridge in one paragraph
 
@@ -109,6 +150,52 @@ triggers resume). 403-style authorization failures are task failures and
 never enter the bridge (§6.3). Terminal tasks are never revived by a fresh
 A′ (§6.3): a follow-up on a terminal run applies revisions but does not
 rewrite the Secret.
+
+`token-execution` is valid only when Execution is approved, the run is not
+terminal, the newest successful AnalysisResult belongs to the current
+AgenticRun generation, and the run's `a2a.lightspeed.io/approved-analysis`
+annotation matches that result's UID/generation. Approval writes that
+identity before atomically storing fresh `token-a` + `token-execution` and
+then applying the caller-authenticated approval patch. Renewal of an existing
+approval repeats the same checks; if analysis moved on, it strips
+`token-execution` and renews only `token-a`. A periodic/startup reconciliation
+derives each Secret name from the already-listed AgenticRun UID and removes
+credentials that fail the durable checks; failed removals retry on the next
+pass. An uncertain approval-update response is resolved from the durable
+approval before cleanup, and an unreadable state is left for reconciliation
+rather than risking removal of a credential for an approval that committed.
+An adapter-terminal renewal timeout/cap is authoritative even if a follow-up
+loaded its task record before the terminal transition; the record is reloaded
+under the run lock before approval or credential work. A successful execution
+approval renewal clears the adapter's auth-required overlay immediately.
+Every present approval stage is immutable: an omitted decision has the
+operator's effective `Approved` meaning, and an omitted Execution decision
+cannot be changed, adopted, or used to mint credentials. Scoped execution
+credentials are renewed only for an explicitly approved stage already bound to
+the current analysis.
+
+Approval/revision operations, watch lifecycle projection, and reconciliation
+use a keyed, process-local per-run mutex to serialize decision, credential,
+pause-deadline, and terminal-cleanup state changes. The periodic sweep
+reconciles current run state so lifecycle events skipped during lock contention
+are retried. **Single replica
+and `Recreate` are required** (`replicas: 1`, Deployment strategy
+`Recreate`): the mutex is not distributed, and a default RollingUpdate could
+overlap old/new adapters so one prepares `token-execution` while the other's
+reconciler removes it before the approval write commits. Reconciliation also
+preserves an execution credential whose Secret preparation timestamp is
+within a two-minute grace window, unless Execution has finished or the run
+is terminal. Keep both deployment requirements until coordination is
+replaced by a cross-replica mechanism.
+
+Same-run revision feedback is written by the adapter service account after
+task ownership validation, with `a2a.lightspeed.io/revised-by` attribution;
+caller-authenticated writes remain in use for run creation and approval
+decisions. A revision stream remains `working` until analysis for the new
+run generation is observed, rather than replaying the stale Proposed gate.
+The same durable generation check applies to message/send, tasks/get,
+resubscribe, and restart recovery; current-generation failures and
+auth-required pauses remain visible.
 
 ### Bounded waits (§6.4)
 
@@ -309,9 +396,16 @@ module and drop the replace.
   attributes the approver from the request user); AgenticRun/Result/
   Approval **reads and run-token Secret writes/deletes happen as the
   adapter SA**.
-- **`analysis.agent` is set explicitly** (default `"default"`, flag
-  `--run-agent`): the design doc's literal `analysis: {}` would be
-  rejected by the CRD's own `MinProperties=1` on the step.
+- **All three step agents are set explicitly** (default `"default"`, flag
+  `--run-agent`): the CRD's `MinProperties=1` rejects empty step objects,
+  and the approval-gated workflow requires analysis, execution, and
+  verification steps on every run.
+- **Analysis output is not Minimal**: execution needs the complete option
+  payload (including remediation plans); the adapter leaves
+  `spec.analysisOutput` unset so the operator uses its full default schema.
+- **Execution-token audience env fallback.** `--execution-token-audience`
+  falls back to `EXECUTION_TOKEN_AUDIENCE`; empty disables the feature. A
+  non-empty value requires `--run-token-audience`, which has no env fallback.
 - **Expiry skew direction**: the pre-start check grants grace *after* exp
   (`expired = now > exp + skew`, default 30 s) — it is a pre-check, not
   the validator; see `auth.Expired` for the rationale.
@@ -331,6 +425,12 @@ module and drop the replace.
   approver's mouth. The pending stage named in the input-required message
   is derived from the approval CR (first workflow stage absent from
   `spec.stages`) — repo C exposes no explicit "pending stage" field.
+- **Execution denial completes with the analysis result.** Design §7.2
+  maps all `Denied` runs to `failed`; this adapter deliberately deviates for
+  an Execution denial after `Analyzed=True`: the task is `completed` with
+  the exact status message `Execution rejected by approver; analysis result
+  attached.` and the analysis artifact. This preserves the successful
+  analysis outcome without describing a human choice as an agent failure.
 - **Renewal does not wait for repo C to clear the condition.** After the
   Secret rewrite the task immediately projects its derived (in-flight)
   phase; repo C clears `CredentialsExpired` on its own 30 s poll. The
@@ -379,24 +479,27 @@ against this implementation (M4 pass):
 - **`secrets`: `create/get/update/delete`.** `delete` is the §5.5
   terminal-run cleanup and the run-deletion cleanup (`watch.go`
   `Sweep`/`RunDeleted`). Namespace isolation remains the real boundary.
-- **`agenticruns`: `get/list/watch/update`.** `update` covers exactly one
-  write: persisting the §6.4 pause counter as the
-  `a2a.lightspeed.io/credential-pauses` annotation (`watch.go`
-  `persistPauseCount`). The adapter NEVER writes `agenticruns/status` or
-  conditions (design §6.1) — no status-subresource grant.
-- **`agenticrunapprovals`: `get` only.** Approval DECISIONS are patched
-  **as the caller** (Token H) — that authorization is hub
-  `Authentication`/RoleBinding wiring (keycloak-oidc chart work), giving
-  H-authenticated principals `update` on `agenticrunapprovals` in the run
-  namespace.
+- **`agenticruns`: `get/list/watch/update`.** `update` covers adapter-owned
+  annotations only: the §6.4 pause counter, revision attribution, and the
+  approved-analysis identity used to bind execution credentials. Revision
+  feedback itself is also written by the adapter SA after ownership checks.
+  The adapter NEVER writes `agenticruns/status` or conditions (design §6.1)
+  — no status-subresource grant. Existing run list/get access is sufficient
+  for execution-token reconciliation; no Secret `list` permission is needed.
+- **`agenticrunapprovals`: adapter `get/list/watch`; caller `get/update`.**
+  The adapter SA reads pending-stage state, but decision reads and patches
+  happen **as the caller** (Token H). The caller's hub-authenticated group
+  must have both `get` and `update` on `agenticrunapprovals` in the run
+  namespace through hub Authentication/RoleBinding wiring (keycloak-oidc
+  chart work).
 - The result-CR `get/list/watch` grants match the implementation (reads +
   informers).
 
-Run CREATION is authorized as the caller (Token H): the hub
-`Authentication`/RoleBinding wiring that lets H create agenticruns is
-keycloak-oidc chart work (concurrent implementer), not adapter work. The
-chart must also ship the §4.3 admission policy and document the
-`oc auth can-i` escalation checks.
+Run CREATION and approval decisions are authorized as the caller (Token H):
+the hub Authentication/RoleBinding wiring that lets H-authenticated
+principals create AgenticRuns and get/update AgenticRunApprovals is external
+to this adapter component. The chart must also ship the §4.3 admission
+policy and document the `oc auth can-i` escalation checks.
 
 ## Contract friction found against repo C (a2a-support)
 
@@ -409,12 +512,12 @@ Reported, not worked around silently:
    while the AgenticRun stays paused on-cluster until TTL GC. A stop
    semantic for "caller gave up" (design Q6) would close this.
 2. **Approval "pending stage" is not exposed.** The AgenticRunApproval CR
-   has no field saying which stage is currently awaited; the adapter
-   derives it (first workflow stage absent from append-only
-   `spec.stages`), which is a heuristic against ApprovalPolicy-driven
-   gating (a policy could auto-approve a stage without a spec entry).
-   Correct enough for the message text, but the caller's decision should
-   name the stage explicitly (it must, in our DataPart shape).
+   has no field saying which stage is currently awaited. This pattern has a
+   single manual checkpoint (Execution after automatic Analysis approval),
+   so the adapter projects Execution only while the run is Proposed and no
+   Execution decision exists; it does not guess the next absent stage in the
+   append-only approval list. The caller must still name the stage explicitly
+   in the decision DataPart.
 3. **modify/redirect approval decisions have no CR-side mapping** (see
    design decisions above) — rejected rather than degraded.
 4. **The pause condition persists after renewal** until repo C's next 30 s
@@ -445,8 +548,26 @@ Reported, not worked around silently:
 - Token A/H values are never logged (fingerprints only), never in CR
   fields, never in A2A responses, never in error messages
   (`auth.ExchangeError` redacts JWT-shaped strings defensively).
-- The adapter never *reads* a run-token Secret to make decisions; it only
-  writes (and, at terminal+grace, deletes).
+- The adapter never reads run-token data bytes. Secret reads are limited to
+  owned-object updates, key presence, and the execution-token preparation
+  timestamp used by reconciliation; credential values are never logged or
+  returned. It removes only the `token-execution` key after execution (and,
+  at terminal+grace, deletes the whole Secret).
+- `token-a` is the reader-only run credential. `token-execution` is minted
+  only for an Execution approval bound to the current successful analysis;
+  its Secret update with a fresh `token-a` is atomic and precedes the
+  caller-authenticated approval patch. It is removed at execution completion
+  and reconciled at startup/periodically against durable approval, run, and
+  analysis identity. If an approval write reports failure, the adapter
+  re-reads durable state before deciding whether cleanup is safe.
+- Reconciliation conservatively retains a just-prepared execution
+  credential for two minutes unless the run is terminal or Execution has
+  finished, preventing a rolling/overlapping process from racing approval.
+- With `--execution-token-audience` enabled, exchanged tokens are locally
+  fail-closed on unverified `aud`: R must exclude the execution audience;
+  R_exec must include it and exclude the reader audience before either is
+  written, and rejections log only a token fingerprint. This claim check is
+  not signature validation; upstream validators remain authoritative.
 - Ownership is validated on EVERY operation — get, cancel, stream,
   resubscribe, duplicate-message replay, renewal, and approval decisions;
   a mismatch is `TaskNotFound` (existence is not confirmed to non-owners).

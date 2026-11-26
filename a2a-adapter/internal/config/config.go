@@ -67,6 +67,11 @@ type Config struct {
 	// Empty (default) keeps storing Token A.
 	RunTokenAudience string
 
+	// ExecutionTokenAudience, when set, enables approval-gated execution
+	// credentials. It requires RunTokenAudience so an approval refresh can
+	// atomically renew both token-a and token-execution.
+	ExecutionTokenAudience string
+
 	// InboundHubToken: the inbound bearer is already Token H (the Praxis hub
 	// gateway exchanged A->H). The adapter uses it directly to create runs
 	// and, with RunTokenAudience, exchanges it (not A) into the run token R.
@@ -143,6 +148,7 @@ func (c *Config) AddFlags(fs *flag.FlagSet) {
 	fs.StringVar(&c.SVIDSocketPath, "svid-socket", envOr("SPIFFE_SOCKET", ""), "SPIFFE Workload API unix socket (SVID client-assertion mode; env SPIFFE_SOCKET)")
 	fs.StringVar(&c.HubAudience, "hub-audience", "", "requested audience for the exchanged hub token (Token H)")
 	fs.StringVar(&c.RunTokenAudience, "run-token-audience", "", "when set, store a run token R (exchange of the inbound token for this audience, e.g. the spoke gateway's exchanger client) in the run-token Secret instead of the inbound token; empty = store it as-is")
+	fs.StringVar(&c.ExecutionTokenAudience, "execution-token-audience", envOr("EXECUTION_TOKEN_AUDIENCE", ""), "when set, mint token-execution only when Execution is approved (requires --run-token-audience; env EXECUTION_TOKEN_AUDIENCE)")
 	fs.BoolVar(&c.InboundHubToken, "inbound-hub-token", false, "the inbound bearer is already Token H (exchanged by the Praxis hub gateway): use it directly for kube calls, no A->H exchange in the adapter")
 	fs.StringVar(&c.TargetHeader, "target-header", "X-Hub-Cluster", "inbound transport header carrying the target cluster (design §4.2)")
 	fs.StringVar(&c.AllowedTargetsRaw, "allowed-targets", "", "comma-separated allow-list of spoke (target cluster) names, e.g. east,west. Empty (default) = no allow-list enforcement: any well-formed target is accepted and the admission policy remains the hard gate; when set, a fresh submit with an unlisted target fails fast before any AgenticRun or run-token Secret is created")
@@ -158,13 +164,13 @@ func (c *Config) AddFlags(fs *flag.FlagSet) {
 	fs.DurationVar(&c.StartupRetryTimeout, "startup-retry-timeout", 5*time.Minute, "how long startup (recovery LIST + informer start) retries transient API/storage errors (CRD storage still initializing, 503/504, timeouts, connection refused, flapping etcd) with exponential backoff before exiting; 0 = fail fast")
 
 	fs.StringVar(&c.AgentName, "card-name", "lightspeed-hub", "agent card name")
-	fs.StringVar(&c.AgentDescription, "card-description", "Red Hat cluster investigation via lightspeed-hub", "agent card description")
+	fs.StringVar(&c.AgentDescription, "card-description", "Red Hat cluster investigation via lightspeed-hub, with an approval checkpoint before cluster changes", "agent card description")
 	fs.StringVar(&c.AgentURL, "card-url", "", "agent card URL (the Praxis-fronted origin callers use)")
 	fs.StringVar(&c.AgentVersion, "card-version", "0.1.0", "agent card version")
 	fs.StringVar(&c.AgentProtocolVersion, "card-protocol-version", "0.3.0", "A2A protocol version advertised in the card")
 	fs.StringVar(&c.SkillID, "card-skill-id", "cluster-investigation", "agent card skill id")
 	fs.StringVar(&c.SkillName, "card-skill-name", "Red Hat cluster investigation", "agent card skill name")
-	fs.StringVar(&c.SkillDescription, "card-skill-description", "Investigate a Red Hat cluster (or spoke) via the lightspeed-hub agentic stack: analysis-only AgenticRuns with per-run requester credentials.", "agent card skill description")
+	fs.StringVar(&c.SkillDescription, "card-skill-description", "Investigate a Red Hat cluster (or spoke) via the lightspeed-hub agentic stack; execution waits at an approval checkpoint before any cluster change.", "agent card skill description")
 }
 
 // Validate fills defaults and checks required values.
@@ -189,6 +195,9 @@ func (c *Config) Validate() error {
 	}
 	if c.HubAudience == "" {
 		return fmt.Errorf("--hub-audience is required")
+	}
+	if c.ExecutionTokenAudience != "" && c.RunTokenAudience == "" {
+		return fmt.Errorf("--execution-token-audience requires --run-token-audience")
 	}
 	if c.SVIDSocketPath == "" && (c.KeycloakClientID == "" || c.KeycloakClientSecret == "") {
 		return fmt.Errorf("exchange client auth requires either --keycloak-client-id+secret or --svid-socket")

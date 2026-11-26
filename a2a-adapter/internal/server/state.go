@@ -72,6 +72,18 @@ func RunTerminalPhase(run *agenticv1alpha1.AgenticRun) bool {
 	}
 }
 
+// revisionAnalysisPending mirrors repo C's needsRevision predicate. The
+// old Proposed condition remains visible until analysis observes the new
+// generation; suppress only that stale checkpoint, not current-generation
+// failures or task overlays such as auth-required.
+func revisionAnalysisPending(run *agenticv1alpha1.AgenticRun) bool {
+	if run == nil || run.Spec.RevisionFeedback == "" {
+		return false
+	}
+	analyzed := findCondition(run, agenticv1alpha1.AgenticRunConditionAnalyzed)
+	return analyzed != nil && run.Generation > analyzed.ObservedGeneration
+}
+
 // CredentialsExpired reports whether the run carries repo C's pause
 // condition (CredentialsExpired=True; the reason is always
 // ReasonCredentialsExpired when the controller wrote it). Design §6.1
@@ -134,4 +146,11 @@ func TerminalState(state a2a.TaskState) bool {
 	default:
 		return false
 	}
+}
+
+// StreamFinalState marks states that end a particular SSE response. An
+// input-required task remains resumable through a follow-up message, but its
+// current stream is interrupted and must end at the approval checkpoint.
+func StreamFinalState(state a2a.TaskState) bool {
+	return TerminalState(state) || state == a2a.TaskStateInputRequired
 }

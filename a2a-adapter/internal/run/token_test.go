@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	agenticv1alpha1 "github.com/openshift/lightspeed-agentic-operator/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
@@ -49,6 +50,16 @@ func TestWriteTokenSecretContract(t *testing.T) {
 	}
 	if got := s.Annotations[AnnotationWrittenBy]; got != "adapter-sa" {
 		t.Errorf("annotation written-by = %q", got)
+	}
+	if len(s.OwnerReferences) != 1 {
+		t.Fatalf("owner references = %+v, want one AgenticRun owner", s.OwnerReferences)
+	}
+	owner := s.OwnerReferences[0]
+	if owner.APIVersion != agenticv1alpha1.GroupVersion.String() || owner.Kind != "AgenticRun" || owner.Name != run.Name || owner.UID != run.UID {
+		t.Errorf("owner reference = %+v, does not identify the run", owner)
+	}
+	if owner.Controller == nil || *owner.Controller || owner.BlockOwnerDeletion == nil || *owner.BlockOwnerDeletion {
+		t.Errorf("owner ref must be non-controller and non-blocking: %+v", owner)
 	}
 }
 
@@ -132,6 +143,99 @@ func TestWriteTokenSecretSameValueNoOp(t *testing.T) {
 	}
 }
 
+func TestTokenWriterPreservesAndRemovesExecutionCredentialPerKey(t *testing.T) {
+	secrets := newFakeSecrets()
+	w := &TokenWriter{Secrets: secrets, Namespace: "test-ns", Identity: "adapter-sa"}
+	run := newTestRun("uid-execution", "spoke-exec")
+	ctx := context.Background()
+	if err := w.Write(ctx, run, "run-one"); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.WriteExecution(ctx, run, "execution-one"); err != nil {
+		t.Fatal(err)
+	}
+	beforeNoop := secrets.get("test-ns", RunTokenSecretName("uid-execution")).ResourceVersion
+	if err := w.WriteExecution(ctx, run, "execution-one"); err != nil {
+		t.Fatal(err)
+	}
+	if got := secrets.get("test-ns", RunTokenSecretName("uid-execution")).ResourceVersion; got != beforeNoop {
+		t.Errorf("same-value execution key update changed RV: %s -> %s", beforeNoop, got)
+	}
+	if err := w.Write(ctx, run, "run-two"); err != nil {
+		t.Fatal(err)
+	}
+	secret := secrets.get("test-ns", RunTokenSecretName("uid-execution"))
+	if string(secret.Data[RunTokenKey]) != "run-two" || string(secret.Data[ExecutionTokenKey]) != "execution-one" {
+		t.Fatalf("run-token renewal did not preserve the execution key (keys=%v)", keys(secret.Data))
+	}
+	if err := w.RemoveExecution(ctx, "uid-execution"); err != nil {
+		t.Fatal(err)
+	}
+	secret = secrets.get("test-ns", RunTokenSecretName("uid-execution"))
+	if _, exists := secret.Data[ExecutionTokenKey]; exists {
+		t.Fatal("RemoveExecution left the execution key")
+	}
+	if string(secret.Data[RunTokenKey]) != "run-two" {
+		t.Fatal("RemoveExecution removed or changed token-a")
+	}
+	beforeIdempotentRemove := secret.ResourceVersion
+	if err := w.RemoveExecution(ctx, "uid-execution"); err != nil {
+		t.Fatal(err)
+	}
+	if got := secrets.get("test-ns", RunTokenSecretName("uid-execution")).ResourceVersion; got != beforeIdempotentRemove {
+		t.Errorf("idempotent RemoveExecution changed RV: %s -> %s", beforeIdempotentRemove, got)
+	}
+}
+
+func TestRemoveExecutionUnlessRecentlyWrittenHonorsGraceAndForce(t *testing.T) {
+	secrets := newFakeSecrets()
+	w := &TokenWriter{Secrets: secrets, Namespace: "test-ns", Identity: "adapter-sa"}
+	run := newTestRun("uid-recent-exec", "spoke-a")
+	ctx := context.Background()
+	if err := w.WriteWithExecution(ctx, run, "reader", "writer"); err != nil {
+		t.Fatal(err)
+	}
+	secretName := RunTokenSecretName(string(run.UID))
+	secret := secrets.get("test-ns", secretName)
+	now := time.Now().UTC()
+	secret.Annotations[AnnotationExecutionTokenWrittenAt] = now.Add(-time.Minute).Format(time.RFC3339Nano)
+	secrets.mu.Lock()
+	secrets.secrets["test-ns/"+secretName] = secret
+	secrets.mu.Unlock()
+
+	removed, err := w.RemoveExecutionUnlessRecentlyWritten(ctx, string(run.UID), now, 2*time.Minute, false)
+	if err != nil || removed {
+		t.Fatalf("recent credential removal = (%v, %v), want (false, nil)", removed, err)
+	}
+	if got := secrets.get("test-ns", secretName); len(got.Data[ExecutionTokenKey]) == 0 {
+		t.Fatal("recent token-execution was removed inside the grace window")
+	}
+
+	removed, err = w.RemoveExecutionUnlessRecentlyWritten(ctx, string(run.UID), now.Add(3*time.Minute), 2*time.Minute, false)
+	if err != nil || !removed {
+		t.Fatalf("stale credential removal = (%v, %v), want (true, nil)", removed, err)
+	}
+	if got := secrets.get("test-ns", secretName); len(got.Data[ExecutionTokenKey]) != 0 {
+		t.Fatal("stale token-execution was retained after the grace window")
+	}
+
+	if err := w.WriteWithExecution(ctx, run, "reader-2", "writer-2"); err != nil {
+		t.Fatal(err)
+	}
+	removed, err = w.RemoveExecutionUnlessRecentlyWritten(ctx, string(run.UID), now, 2*time.Minute, true)
+	if err != nil || !removed {
+		t.Fatalf("forced terminal cleanup = (%v, %v), want (true, nil)", removed, err)
+	}
+}
+
+func keys(data map[string][]byte) []string {
+	var out []string
+	for key := range data {
+		out = append(out, key)
+	}
+	return out
+}
+
 // TestWriteTokenSecretForeignTakeover asserts design §5.6: a Secret the
 // adapter did not write is overwritten wholesale, never consumed.
 func TestWriteTokenSecretForeignTakeover(t *testing.T) {
@@ -164,5 +268,15 @@ func TestWriteTokenSecretForeignTakeover(t *testing.T) {
 	}
 	if s.Annotations[AnnotationWrittenBy] != "adapter-sa" {
 		t.Errorf("provenance annotation not stamped: %v", s.Annotations)
+	}
+	if len(s.OwnerReferences) != 1 {
+		t.Fatalf("takeover owner references = %+v, want one AgenticRun owner", s.OwnerReferences)
+	}
+	owner := s.OwnerReferences[0]
+	if owner.APIVersion != agenticv1alpha1.GroupVersion.String() || owner.Kind != "AgenticRun" || owner.Name != run.Name || owner.UID != run.UID {
+		t.Errorf("takeover owner reference = %+v, does not identify run", owner)
+	}
+	if owner.Controller == nil || *owner.Controller || owner.BlockOwnerDeletion == nil || *owner.BlockOwnerDeletion {
+		t.Errorf("takeover owner ref must be non-controller and non-blocking: %+v", owner)
 	}
 }

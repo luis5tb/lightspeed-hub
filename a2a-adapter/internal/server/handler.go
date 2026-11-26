@@ -28,6 +28,10 @@ type Config struct {
 	// Namespace is where AgenticRuns (and their run-token Secrets) live —
 	// the repo C operator namespace (design §8.3 / Q4).
 	Namespace string
+	// RunTokenAudience and ExecutionTokenAudience configure the local aud
+	// downscoping guard for exchanged credentials stored in run-token Secrets.
+	RunTokenAudience       string
+	ExecutionTokenAudience string
 	// TargetHeader is the fixed hub-leg transport header carrying the
 	// target cluster (design §4.2; "X-Hub-Cluster" proposed, renameable
 	// at the chart level).
@@ -96,6 +100,10 @@ type Deps struct {
 	// credential is unusable anywhere but the spoke gateway. Nil keeps
 	// storing Token A (the original contract).
 	RunTokenExchanger auth.Exchanger
+	// ExecutionTokenExchanger mints an execution-only token. It is used only
+	// for an approved Execution on a spoke, before the caller's approval
+	// patch is sent to the API.
+	ExecutionTokenExchanger auth.Exchanger
 	// Readers reads AgenticRuns as the ADAPTER SA (RBAC §8.1:
 	// get/list/watch in the run namespace). Used for tasks/get,
 	// projections, and restart recovery.
@@ -104,9 +112,9 @@ type Deps struct {
 	// (design §7.1/§7.2: artifacts, token usage, approval state).
 	Results run.ResultClient
 	// Submitters builds per-request RunClients authenticated AS THE
-	// CALLER via Token H (design §3.3: never create runs — or make
-	// approval decisions — as the adapter SA). Used for
-	// CreateRun/UpdateRun/UpdateApproval.
+	// CALLER via Token H for run creation and approval decisions. Revisions
+	// and adapter bookkeeping are written through Readers as the adapter SA
+	// after ownership checks.
 	Submitters run.RunClientFactory
 	// Runs maps messages onto AgenticRun CRs (design §4.1).
 	Runs *run.Creator
@@ -120,8 +128,9 @@ type Deps struct {
 // Handler implements a2asrv.RequestHandler: the A2A surface of design §2
 // on top of the store + AgenticRun machinery.
 type Handler struct {
-	cfg  Config
-	deps Deps
+	cfg   Config
+	deps  Deps
+	locks *runLocks
 }
 
 var _ a2asrv.RequestHandler = (*Handler)(nil)
@@ -131,7 +140,7 @@ func New(cfg Config, deps Deps) (*Handler, error) {
 	if err := fillDefaults(&cfg, &deps); err != nil {
 		return nil, err
 	}
-	return &Handler{cfg: cfg, deps: deps}, nil
+	return &Handler{cfg: cfg, deps: deps, locks: newRunLocks()}, nil
 }
 
 func fillDefaults(cfg *Config, deps *Deps) error {
@@ -159,6 +168,14 @@ func fillDefaults(cfg *Config, deps *Deps) error {
 	if deps.Store == nil || deps.Credentials == nil || deps.Readers == nil ||
 		deps.Results == nil || deps.Submitters == nil || deps.Runs == nil || deps.Tokens == nil {
 		return errors.New("server: all deps are required")
+	}
+	if cfg.ExecutionTokenAudience != "" {
+		if cfg.RunTokenAudience == "" {
+			return errors.New("server: execution token audience requires run token audience")
+		}
+		if deps.RunTokenExchanger == nil || deps.ExecutionTokenExchanger == nil {
+			return errors.New("server: execution token audience requires both run and execution token exchangers")
+		}
 	}
 	if deps.Logger == nil {
 		deps.Logger = slog.Default()
@@ -250,7 +267,33 @@ func (h *Handler) runCredential(ctx context.Context, cred *auth.Credential) (str
 		}
 		return "", fmt.Errorf("%w: run-token exchange: %v", a2a.ErrInternalError, err)
 	}
+	if err := h.checkRunTokenAudience(tokenR); err != nil {
+		return "", err
+	}
 	return tokenR, nil
+}
+
+func (h *Handler) executionCredential(ctx context.Context, cred *auth.Credential) (string, error) {
+	if h.deps.ExecutionTokenExchanger == nil {
+		return "", fmt.Errorf("execution-token exchange is not configured")
+	}
+	token, err := h.deps.ExecutionTokenExchanger.Exchange(ctx, cred.TokenA)
+	if err != nil {
+		var xe *auth.ExchangeError
+		if errors.As(err, &xe) {
+			switch xe.Kind {
+			case auth.ErrorKindInvalidGrant:
+				return "", fmt.Errorf("%w: subject token rejected by execution-token exchange", a2a.ErrUnauthenticated)
+			case auth.ErrorKindInvalidClient, auth.ErrorKindDenied:
+				return "", fmt.Errorf("%w: execution-token exchange: %v", a2a.ErrUnauthorized, err)
+			}
+		}
+		return "", fmt.Errorf("%w: execution-token exchange: %v", a2a.ErrInternalError, err)
+	}
+	if err := h.checkExecutionTokenAudience(token); err != nil {
+		return "", err
+	}
+	return token, nil
 }
 
 // ---- message parsing helpers -----------------------------------------------
@@ -289,6 +332,25 @@ func reviseOf(msg *a2a.Message) string {
 		}
 	}
 	return ""
+}
+
+// validateFollowUpCommand rejects combinations whose order could otherwise
+// partially authorize a write before another command in the same message is
+// found to be invalid. One message carries at most one approve, reject, or
+// revise command.
+func validateFollowUpCommand(msg *a2a.Message) error {
+	commands := 0
+	for _, data := range dataPartsOf(msg) {
+		for _, key := range []string{"approve", "reject", "revise"} {
+			if _, ok := data[key]; ok {
+				commands++
+			}
+		}
+	}
+	if commands > 1 {
+		return fmt.Errorf("approve, reject, and revise commands are mutually exclusive")
+	}
+	return nil
 }
 
 // approvalDecision is the parsed approve/reject DataPart (design §7.1: the
@@ -332,12 +394,16 @@ func approvalDecisionOf(msg *a2a.Message) (*approvalDecision, error) {
 		if c, ok := fields["comment"].(string); ok {
 			dec.Comment = c
 		}
-		if opt, ok := fields["option"].(float64); ok {
+		if rawOption, exists := fields["option"]; exists {
 			if stage != agenticv1alpha1.ApprovalStageExecution {
 				return nil, fmt.Errorf("option index only applies to an Execution approval")
 			}
-			if opt < 0 {
-				return nil, fmt.Errorf("option index must be >= 0")
+			opt, ok := rawOption.(float64)
+			if !ok {
+				return nil, fmt.Errorf("option index must be a non-negative whole number")
+			}
+			if opt < 0 || opt != float64(int64(opt)) || opt > float64(int32(^uint32(0)>>1)) {
+				return nil, fmt.Errorf("option index must be a non-negative whole number")
 			}
 			v := int32(opt)
 			dec.Option = &v
@@ -397,8 +463,26 @@ func (h *Handler) project(ctx context.Context, rec *store.TaskRecord) (*store.Ta
 	}
 
 	state := TaskStateFor(runCR)
+	if state == a2a.TaskStateInputRequired && revisionAnalysisPending(runCR) {
+		// The CR may still expose the previous generation's Proposed phase
+		// while its accepted revision is being analyzed. Use durable CR state
+		// so message/send, get, resubscribe, and recovery share this projection.
+		state = a2a.TaskStateWorking
+	}
+	if agenticv1alpha1.DerivePhase(runCR.Status.Conditions) == agenticv1alpha1.AgenticRunPhaseProposed {
+		// This pattern has one manual gate: Execution after analysis. Once
+		// that stage has any decision, the operator may not have reconciled
+		// yet; expose working rather than infer a phantom Verification or
+		// Escalation gate from an absent ApprovalPolicy entry.
+		approval, approvalErr := h.deps.Results.GetApproval(ctx, h.cfg.Namespace, runCR.Name)
+		if approvalErr == nil && executionWasDecided(approval) {
+			state = a2a.TaskStateWorking
+		}
+	}
 	message := StatusMessageFor(runCR, state)
-	rec.State = string(state)
+	executionRejected := state == a2a.TaskStateFailed &&
+		agenticv1alpha1.DerivePhase(runCR.Status.Conditions) == agenticv1alpha1.AgenticRunPhaseDenied &&
+		h.deniedAtExecution(ctx, runCR)
 
 	artifacts, usage := h.artifactsFor(ctx, runCR)
 	ids := make([]string, len(artifacts))
@@ -417,18 +501,27 @@ func (h *Handler) project(ctx context.Context, rec *store.TaskRecord) (*store.Ta
 		state = a2a.TaskStateAuthRequired
 		message = StatusMessageFor(nil, a2a.TaskStateAuthRequired)
 	}
+	if executionRejected {
+		// Execution denial is an approval outcome, not an execution
+		// failure: the analysis artifact is the completed caller result.
+		state = a2a.TaskStateCompleted
+		message = "Execution rejected by approver; analysis result attached."
+	}
+	rec.State = string(state)
+	var statusMsg *a2a.Message
 	if state == a2a.TaskStateInputRequired {
-		if detail := h.approvalDetail(ctx, runCR); detail != "" {
-			message = detail
-		}
+		statusMsg = h.approvalDetail(ctx, runCR)
 	}
 
 	now := h.cfg.now()
 	task := &a2a.Task{
 		ID:        a2a.TaskID(rec.TaskID),
 		ContextID: rec.ContextID,
-		Status:    a2a.TaskStatus{State: state, Timestamp: &now, Message: h.statusMessage(message)},
+		Status:    a2a.TaskStatus{State: state, Timestamp: &now, Message: statusMsg},
 		Artifacts: artifacts,
+	}
+	if task.Status.Message == nil {
+		task.Status.Message = h.statusMessage(message)
 	}
 	if usage != nil {
 		task.Metadata = map[string]any{"tokenUsage": usage}
@@ -458,38 +551,92 @@ func (h *Handler) statusMessage(text string) *a2a.Message {
 	}
 }
 
-// approvalDetail names the stage a Proposed run is waiting on, derived
-// from the run's AgenticRunApproval: the first workflow stage not yet
-// present in spec.stages (stages are append-only, decisions immutable).
-// Documented minimal representation — repo C does not expose a "pending
-// stage" field, and its controller-side gating semantics (ApprovalPolicy
-// vs per-run approval) are not fully inspectable from the CR alone.
-func (h *Handler) approvalDetail(ctx context.Context, runCR *agenticv1alpha1.AgenticRun) string {
-	order := []agenticv1alpha1.ApprovalStageType{
-		agenticv1alpha1.ApprovalStageAnalysis,
-		agenticv1alpha1.ApprovalStageExecution,
-		agenticv1alpha1.ApprovalStageVerification,
-		agenticv1alpha1.ApprovalStageEscalation,
+// approvalDetail names the pending stage using the same approval-stage
+// heuristic and attaches the cross-service approvalRequest contract. Missing
+// or unreadable analysis results are intentionally represented as no options.
+func (h *Handler) approvalDetail(ctx context.Context, runCR *agenticv1alpha1.AgenticRun) *a2a.Message {
+	// Proposed is the operator's actual checkpoint: the policy-gated
+	// Execution approval after automatic Analysis approval. Do not infer
+	// another stage merely because it is absent from the append-only spec.
+	pending := agenticv1alpha1.ApprovalStageExecution
+	options, _ := h.analysisOptions(ctx, runCR)
+	var labels []string
+	for _, option := range options {
+		labels = append(labels, fmt.Sprintf("%d) %s", option.Number, option.Title))
 	}
-	pending := order[0]
+	optionText := strings.Join(labels, " ")
+	if optionText == "" {
+		optionText = "none returned"
+	}
+	target := runCR.Spec.TargetCluster
+	if target == "" {
+		target = "hub-local"
+	}
+	text := fmt.Sprintf("Analysis complete. Approval required to run the %s stage on cluster %s. Options: %s. Reply approve (optionally choosing an option number) or reject.", pending, target, optionText)
+	if pending != agenticv1alpha1.ApprovalStageExecution {
+		text = fmt.Sprintf("Approval required for the %s stage on cluster %s. Options: %s. Reply approve or reject.", pending, target, optionText)
+	}
+	return &a2a.Message{
+		Role: a2a.MessageRoleAgent,
+		ID:   string(a2a.NewTaskID()),
+		Parts: []a2a.Part{
+			a2a.TextPart{Text: text},
+			a2a.DataPart{Data: map[string]any{"approvalRequest": map[string]any{
+				"stage":         string(pending),
+				"run":           runCR.Name,
+				"targetCluster": runCR.Spec.TargetCluster,
+				"options":       options,
+				"decisions":     []string{"approve", "reject"},
+			}}},
+		},
+	}
+}
+
+type approvalOption struct {
+	Index   int    `json:"index"`
+	Number  int    `json:"number"`
+	Title   string `json:"title"`
+	Summary string `json:"summary"`
+}
+
+// analysisOptions returns the latest successful AnalysisResult's options
+// in the exact index order consumed by ExecutionApproval.option.
+func (h *Handler) analysisOptions(ctx context.Context, runCR *agenticv1alpha1.AgenticRun) ([]approvalOption, bool) {
+	name, ok := newestSucceeded(runCR.Status.Steps.Analysis.Results)
+	if !ok {
+		return []approvalOption{}, false
+	}
+	result, err := h.deps.Results.GetAnalysisResult(ctx, h.cfg.Namespace, name)
+	if err != nil || result == nil {
+		return []approvalOption{}, false
+	}
+	options := make([]approvalOption, 0, len(result.Status.Options))
+	for index, option := range result.Status.Options {
+		summary := []rune(option.Summary)
+		if len(summary) > 500 {
+			summary = summary[:500]
+		}
+		options = append(options, approvalOption{
+			Index: index, Number: index + 1, Title: option.Title, Summary: string(summary),
+		})
+	}
+	return options, true
+}
+
+func (h *Handler) deniedAtExecution(ctx context.Context, runCR *agenticv1alpha1.AgenticRun) bool {
+	if cond := findCondition(runCR, agenticv1alpha1.AgenticRunConditionAnalyzed); cond == nil || cond.Status != metav1.ConditionTrue {
+		return false
+	}
 	approval, err := h.deps.Results.GetApproval(ctx, h.cfg.Namespace, runCR.Name)
-	if err == nil && approval != nil {
-		seen := map[agenticv1alpha1.ApprovalStageType]bool{}
-		for _, stage := range approval.Spec.Stages {
-			seen[stage.Type] = true
-		}
-		for _, stageType := range order {
-			if !seen[stageType] {
-				pending = stageType
-				break
-			}
+	if err != nil || approval == nil {
+		return false
+	}
+	for _, stage := range approval.Spec.Stages {
+		if stage.Type == agenticv1alpha1.ApprovalStageExecution && stage.Decision == agenticv1alpha1.ApprovalDecisionDenied {
+			return true
 		}
 	}
-	return fmt.Sprintf(
-		"approval requested for stage %s: reply on this task with a DataPart "+
-			`{"approve":{"stage":"%s"}} (add "option":<index> for Execution) `+
-			`or {"reject":{"stage":"%s"}}`,
-		pending, pending, pending)
+	return false
 }
 
 // artifactsFor builds the A2A artifacts (design §7.2) from the Result CRs
@@ -624,8 +771,36 @@ func (h *Handler) findTask(ctx context.Context, taskID string, principal string)
 		if runCR.Annotations[run.AnnotationTaskID] != taskID {
 			continue
 		}
-		rec := recordFromRun(runCR)
+		if runCR.UID == "" {
+			continue
+		}
+		// Lazy recovery can race Sweep's first lifecycle projection. Serialize
+		// the cache fill with that projection, then prefer its current record
+		// rather than replacing adapter-only terminal state with a CR-derived
+		// record that cannot contain it.
+		unlock := h.locks.Lock(string(runCR.UID))
+		currentRun, getErr := h.deps.Readers.GetRun(ctx, h.cfg.Namespace, runCR.Name)
+		if getErr != nil {
+			unlock()
+			if apierrors.IsNotFound(getErr) {
+				continue
+			}
+			return nil, fmt.Errorf("get agenticrun for task recovery: %w", getErr)
+		}
+		if currentRun.UID != runCR.UID || currentRun.Annotations[run.AnnotationTaskID] != taskID {
+			unlock()
+			continue
+		}
+		if current, ok := h.deps.Store.Task(taskID); ok {
+			unlock()
+			if !current.HasRun || current.RunName != currentRun.Name || current.RunUID != string(currentRun.UID) {
+				return nil, a2a.ErrTaskNotFound
+			}
+			return current, nil
+		}
+		rec := recordFromRun(currentRun)
 		h.deps.Store.PutTask(rec)
+		unlock()
 		h.deps.Logger.Info("rehydrated task from agenticrun",
 			"task_id", rec.TaskID, "run", rec.RunName)
 		return rec, nil
@@ -663,6 +838,7 @@ func recordFromRun(runCR *agenticv1alpha1.AgenticRun) *store.TaskRecord {
 		cond.Status == metav1.ConditionTrue && !RunTerminalPhase(runCR) {
 		rec.AuthPaused = true
 		rec.AuthPausedAt = cond.LastTransitionTime.Time
+		rec.CredentialPauseObservedAt = cond.LastTransitionTime.Time
 		if rec.AuthPausedAt.IsZero() {
 			// Defensive: a condition without a transition time (never
 			// produced by a real API server) falls back to the CR's
@@ -689,6 +865,10 @@ func (h *Handler) Recover(ctx context.Context) error {
 			continue // not ours
 		}
 		h.deps.Store.PutTask(recordFromRun(runCR))
+		if err := h.reconcileExecutionToken(ctx, runCR.Name); err != nil {
+			h.deps.Logger.Error("startup execution-token reconciliation failed; sweeper will retry",
+				"run", runCR.Name, "run_uid", string(runCR.UID), "error", err)
+		}
 	}
 	h.deps.Logger.Info("startup recovery complete", "runs", len(list.Items))
 	return nil
@@ -732,6 +912,9 @@ func (h *Handler) handleSend(ctx context.Context, params *a2a.MessageSendParams)
 			return nil, a2a.ErrTaskNotFound
 		}
 		return h.taskFromRecord(ctx, rec)
+	}
+	if err := validateFollowUpCommand(msg); err != nil {
+		return nil, fmt.Errorf("%w: %v", a2a.ErrInvalidParams, err)
 	}
 
 	// Deterministic target rules (design §4.2): structured data only,
@@ -817,12 +1000,39 @@ func (h *Handler) handleSend(ctx context.Context, params *a2a.MessageSendParams)
 		// A'): do NOT write a dead token and do NOT destroy the run
 		// binding — the task stays wherever it is (auth-required if the
 		// run paused; the previous state otherwise) and the caller may
-		// retry with a live token.
-		rec.LastMessageID = msg.ID
-		h.deps.Store.PutTask(rec)
+		// retry with a live token. This branch is before handleFollowUp's
+		// run lock, so reload the record and validate its binding under the
+		// shared lock before updating message bookkeeping. A stale request
+		// copy must not overwrite a pause-deadline terminal transition.
+		if rec.RunUID == "" || rec.RunName == "" {
+			return nil, a2a.ErrTaskNotFound
+		}
+		unlock := h.locks.Lock(rec.RunUID)
+		defer unlock()
+		current, ok := h.deps.Store.Task(taskID)
+		if !ok || !current.HasRun || current.RunUID != rec.RunUID || current.RunName != rec.RunName ||
+			current.Principal != principal || current.ContextID != contextID {
+			return nil, a2a.ErrTaskNotFound
+		}
+		runCR, err := h.deps.Readers.GetRun(ctx, h.cfg.Namespace, current.RunName)
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil, a2a.ErrTaskNotFound
+			}
+			return nil, fmt.Errorf("%w: %v", a2a.ErrInternalError, err)
+		}
+		if string(runCR.UID) != current.RunUID || runCR.Annotations[run.AnnotationTaskID] != taskID ||
+			runCR.Annotations[run.AnnotationPrincipal] != principal || runCR.Annotations[run.AnnotationContextID] != contextID {
+			return nil, a2a.ErrTaskNotFound
+		}
+		if current.Target != runCR.Spec.TargetCluster || (target != "" && target != runCR.Spec.TargetCluster) {
+			return nil, fmt.Errorf("%w: target is immutable for an existing task", a2a.ErrInvalidParams)
+		}
+		current.LastMessageID = msg.ID
+		h.deps.Store.PutTask(current)
 		h.deps.Logger.Warn("renewal follow-up carried an expired token; not written",
-			"task_id", taskID, "run", rec.RunName, "credential_fp", cred.Fingerprint)
-		return h.taskFromRecord(ctx, rec)
+			"task_id", taskID, "run", current.RunName, "credential_fp", cred.Fingerprint)
+		return h.taskFromRecord(ctx, current)
 	}
 
 	// Follow-up on a live run: revision feedback, an approval decision,
@@ -985,6 +1195,47 @@ func (h *Handler) handleFollowUp(ctx context.Context, rec *store.TaskRecord, msg
 	if rec.Target != runCR.Spec.TargetCluster {
 		return nil, fmt.Errorf("%w: bound run's targetCluster changed under the task record", a2a.ErrInternalError)
 	}
+	principal := auth.PrincipalID(cred.Subject, cred.Issuer)
+	if runCR.Annotations[run.AnnotationPrincipal] != principal {
+		return nil, a2a.ErrTaskNotFound
+	}
+	lockedUID := string(runCR.UID)
+	if lockedUID == "" {
+		return nil, a2a.ErrTaskNotFound
+	}
+	unlock := h.locks.Lock(lockedUID)
+	defer unlock()
+	// Re-read after acquiring the per-run lock: a request that waited behind
+	// another decision/revision must validate and act on the new durable CR.
+	runCR, err = h.deps.Readers.GetRun(ctx, h.cfg.Namespace, rec.RunName)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, a2a.ErrTaskNotFound
+		}
+		return nil, fmt.Errorf("%w: %v", a2a.ErrInternalError, err)
+	}
+	if string(runCR.UID) != lockedUID {
+		// Deterministic names can be reused after TTL deletion. Never use a
+		// run object that changed identity while this request waited for the
+		// original UID's lock.
+		return nil, a2a.ErrTaskNotFound
+	}
+	if runCR.Annotations[run.AnnotationPrincipal] != principal {
+		return nil, a2a.ErrTaskNotFound
+	}
+	if target != "" && target != runCR.Spec.TargetCluster {
+		return nil, fmt.Errorf("%w: target is immutable for an existing task", a2a.ErrInvalidParams)
+	}
+	if rec.Target != runCR.Spec.TargetCluster {
+		return nil, fmt.Errorf("%w: bound run's targetCluster changed under the task record", a2a.ErrInternalError)
+	}
+	currentRec, ok := h.deps.Store.Task(rec.TaskID)
+	if !ok || currentRec.RunName != runCR.Name ||
+		(currentRec.RunUID != "" && currentRec.RunUID != string(runCR.UID)) ||
+		currentRec.Principal != principal {
+		return nil, a2a.ErrTaskNotFound
+	}
+	rec = currentRec
 
 	terminal := RunTerminalPhase(runCR) || rec.AdapterTerminal
 
@@ -995,25 +1246,46 @@ func (h *Handler) handleFollowUp(ctx context.Context, rec *store.TaskRecord, msg
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", a2a.ErrInvalidParams, err)
 	}
-	if decision != nil {
-		if err := h.submitApprovalDecision(ctx, cred, rec, decision); err != nil {
+	if rec.AdapterTerminal {
+		// The store reload above is authoritative: a request-local copy can
+		// predate pause-cap/deadline failure and must not reopen that task.
+		rec.LastMessageID = msg.ID
+		h.deps.Store.PutTask(rec)
+		return h.taskFromRecord(ctx, rec)
+	}
+	if decision != nil && !RunTerminalPhase(runCR) {
+		omittedReplay, err := h.submitApprovalDecision(ctx, cred, rec, runCR, decision)
+		if err != nil {
 			return nil, err
+		}
+		if omittedReplay {
+			// An omitted durable decision is already effectively approved and
+			// immutable. Treat its matching replay as a complete no-op rather
+			// than falling through to the generic credential-renewal path.
+			rec.LastMessageID = msg.ID
+			h.deps.Store.PutTask(rec)
+			return h.taskFromRecord(ctx, rec)
 		}
 	}
 
 	// Revision feedback (§4.1): the CRD's same-run refinement path.
 	if feedback := reviseOf(msg); feedback != "" {
-		tokenH, err := h.tokenH(ctx, cred)
-		if err != nil {
-			return nil, err
+		approval, approvalErr := h.deps.Results.GetApproval(ctx, h.cfg.Namespace, rec.RunName)
+		if approvalErr != nil && !apierrors.IsNotFound(approvalErr) {
+			return nil, fmt.Errorf("%w: read approval before revision: %v", a2a.ErrInternalError, approvalErr)
 		}
-		rc, err := h.deps.Submitters(ctx, tokenH)
-		if err != nil {
+		if executionWasDecided(approval) {
+			return nil, a2a.NewError(a2a.ErrInvalidParams,
+				"execution was already decided for this run; start a new task to request a different remediation")
+		}
+		if err := h.deps.Runs.SubmitRevision(ctx, h.deps.Readers, rec.RunName, feedback, principal); err != nil {
+			if errors.Is(err, run.ErrRevisionNotOwned) {
+				return nil, a2a.ErrTaskNotFound
+			}
 			return nil, fmt.Errorf("%w: %v", a2a.ErrInternalError, err)
 		}
-		if err := h.deps.Runs.SubmitRevision(ctx, rc, rec.RunName, feedback); err != nil {
-			return nil, fmt.Errorf("%w: %v", a2a.ErrInternalError, err)
-		}
+		h.deps.Logger.Info("accepted same-run revision",
+			"task_id", rec.TaskID, "run", rec.RunName, "principal", principal)
 	}
 
 	if terminal {
@@ -1028,18 +1300,50 @@ func (h *Handler) handleFollowUp(ctx context.Context, rec *store.TaskRecord, msg
 			"task_id", rec.TaskID, "run", rec.RunName)
 		return h.taskFromRecord(ctx, rec)
 	}
+	if decision != nil && decision.Denied {
+		// A rejection is a decision, not a credential renewal. In particular,
+		// it must never mint the approval-only execution credential.
+		rec.LastMessageID = msg.ID
+		h.deps.Store.PutTask(rec)
+		return h.taskFromRecord(ctx, rec)
+	}
+	if decision != nil && decision.Stage == agenticv1alpha1.ApprovalStageExecution &&
+		!decision.Denied && runCR.Spec.TargetCluster != "" && h.deps.ExecutionTokenExchanger != nil {
+		// submitApprovalDecision already wrote both keys atomically before
+		// patching the approval as the caller.
+		rec.AuthPaused = false
+		rec.LastMessageID = msg.ID
+		h.deps.Store.PutTask(rec)
+		return h.taskFromRecord(ctx, rec)
+	}
 
 	// Renewal (§6.1 step 5): rewrite token-a with fresh A. Labels are
 	// untouched (run/token.go); the resourceVersion change is repo C's
 	// resume signal (it re-attempts the paused step within its 30 s
 	// requeue — gateway-credential-mode.md "Resume latency"). With a
-	// RunTokenExchanger the fresh A is exchanged into a fresh R first.
+	// RunTokenExchanger the fresh A is exchanged into a fresh R first. An
+	// approved Execution that has not finished also renews token-execution.
 	runCred, err := h.runCredential(ctx, cred)
 	if err != nil {
 		return nil, err
 	}
-	if err := h.deps.Tokens.Write(ctx, runCR, runCred); err != nil {
-		return nil, fmt.Errorf("%w: %v", a2a.ErrInternalError, err)
+	var writeErr error
+	if h.deps.ExecutionTokenExchanger != nil && h.executionCredentialAllowed(ctx, runCR) {
+		executionCred, err := h.executionCredential(ctx, cred)
+		if err != nil {
+			return nil, err
+		}
+		writeErr = h.deps.Tokens.WriteWithExecution(ctx, runCR, runCred, executionCred)
+	} else {
+		if h.deps.ExecutionTokenExchanger != nil {
+			if err := h.deps.Tokens.RemoveExecution(ctx, string(runCR.UID)); err != nil {
+				return nil, fmt.Errorf("%w: remove stale execution credential: %v", a2a.ErrInternalError, err)
+			}
+		}
+		writeErr = h.deps.Tokens.Write(ctx, runCR, runCred)
+	}
+	if writeErr != nil {
+		return nil, fmt.Errorf("%w: %v", a2a.ErrInternalError, writeErr)
 	}
 	rec.AuthPaused = false
 	rec.LastMessageID = msg.ID
@@ -1049,49 +1353,147 @@ func (h *Handler) handleFollowUp(ctx context.Context, rec *store.TaskRecord, msg
 	return h.taskFromRecord(ctx, rec)
 }
 
-// submitApprovalDecision appends the decision stage to the run's
-// AgenticRunApproval as the caller (Token H). Idempotent: a stage of the
-// same type with the same decision is left alone (repo C's CRD makes
-// stages append-only and decisions immutable — a conflicting re-decision
-// is the API server's to reject).
-func (h *Handler) submitApprovalDecision(ctx context.Context, cred *auth.Credential, rec *store.TaskRecord, decision *approvalDecision) error {
+// submitApprovalDecision writes the decision to AgenticRunApproval as the
+// caller (Token H). Existing decisions are checked before option bounds so
+// an idempotent replay still succeeds after the operator trims unselected
+// options from the AnalysisResult.
+func (h *Handler) submitApprovalDecision(ctx context.Context, cred *auth.Credential, rec *store.TaskRecord, runCR *agenticv1alpha1.AgenticRun, decision *approvalDecision) (bool, error) {
 	approval, err := h.deps.Results.GetApproval(ctx, h.cfg.Namespace, rec.RunName)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
-			return fmt.Errorf("%w: no AgenticRunApproval exists for run %s", a2a.ErrInvalidParams, rec.RunName)
+			return false, fmt.Errorf("%w: no AgenticRunApproval exists for run %s", a2a.ErrInvalidParams, rec.RunName)
 		}
-		return fmt.Errorf("%w: %v", a2a.ErrInternalError, err)
+		return false, fmt.Errorf("%w: %v", a2a.ErrInternalError, err)
 	}
-	for _, stage := range approval.Spec.Stages {
-		if stage.Type == decision.Stage {
-			if (stage.Decision == agenticv1alpha1.ApprovalDecisionDenied) == decision.Denied {
-				return nil // duplicate delivery of the same decision
-			}
-			return fmt.Errorf("%w: stage %s already has decision %s (immutable)", a2a.ErrInvalidParams, decision.Stage, stage.Decision)
-		}
-	}
-	dec := agenticv1alpha1.ApprovalDecisionApproved
+
+	requestedDecision := agenticv1alpha1.ApprovalDecisionApproved
 	if decision.Denied {
-		dec = agenticv1alpha1.ApprovalDecisionDenied
+		requestedDecision = agenticv1alpha1.ApprovalDecisionDenied
+	}
+	var existingStage *agenticv1alpha1.ApprovalStage
+	for i := range approval.Spec.Stages {
+		if approval.Spec.Stages[i].Type == decision.Stage {
+			existingStage = &approval.Spec.Stages[i]
+			break
+		}
+	}
+	if existingStage != nil {
+		existingDecision := effectiveApprovalDecision(existingStage.Decision)
+		if existingDecision != requestedDecision {
+			return false, fmt.Errorf("%w: stage %s already has decision %s (immutable)", a2a.ErrInvalidParams, decision.Stage, existingDecision)
+		}
+		if decision.Stage == agenticv1alpha1.ApprovalStageExecution && !decision.Denied {
+			var existingOption *int32
+			if existingStage.Execution != nil {
+				existingOption = existingStage.Execution.Option
+			}
+			if !sameOption(existingOption, decision.Option) {
+				return false, fmt.Errorf("%w: stage %s already has a different option (immutable)", a2a.ErrInvalidParams, decision.Stage)
+			}
+		}
+		if existingStage.Decision == "" {
+			// An omitted decision is effectively approved but does not prove
+			// that this adapter bound the approval to the current analysis.
+			// Its matching replay must not mutate approval, annotations, or
+			// credentials (including the generic run-token renewal path).
+			return true, nil
+		}
+		if decision.Stage != agenticv1alpha1.ApprovalStageExecution || decision.Denied ||
+			runCR.Spec.TargetCluster == "" || h.deps.ExecutionTokenExchanger == nil {
+			return false, nil // idempotent replay without an execution credential
+		}
+		if executionFinished(runCR) {
+			return false, nil // completed/terminal Execution replay never mints again
+		}
+		if !h.executionCredentialAllowed(ctx, runCR) {
+			if cleanupErr := h.deps.Tokens.RemoveExecution(ctx, string(runCR.UID)); cleanupErr != nil {
+				h.deps.Logger.Error("remove execution token for stale approved analysis", "task_id", rec.TaskID, "run", rec.RunName, "error", cleanupErr)
+			}
+			return false, fmt.Errorf("%w: current analysis no longer matches the approved execution; start a new task", a2a.ErrInvalidParams)
+		}
+		return false, h.renewExecutionApprovalCredentials(ctx, cred, rec, runCR)
+	}
+
+	if decision.Stage == agenticv1alpha1.ApprovalStageExecution && decision.Option != nil {
+		options, known := h.analysisOptions(ctx, runCR)
+		if known && int(*decision.Option) >= len(options) {
+			if len(options) == 0 {
+				return false, fmt.Errorf("%w: this analysis has no remediation options; omit option or request a new analysis", a2a.ErrInvalidParams)
+			}
+			return false, fmt.Errorf("%w: option index %d is out of range; choose an option index from 0 to %d or omit option", a2a.ErrInvalidParams, *decision.Option, len(options)-1)
+		}
 	}
 	approval.Spec.Stages = append(approval.Spec.Stages,
-		agenticv1alpha1.NewApprovalStage(decision.Stage, dec, "", decision.Option))
+		agenticv1alpha1.NewApprovalStage(decision.Stage, requestedDecision, "", decision.Option))
 
 	tokenH, err := h.tokenH(ctx, cred)
 	if err != nil {
-		return err
+		return false, err
 	}
 	rc, err := h.deps.Submitters(ctx, tokenH)
 	if err != nil {
-		return fmt.Errorf("%w: %v", a2a.ErrInternalError, err)
+		return false, fmt.Errorf("%w: %v", a2a.ErrInternalError, err)
+	}
+	dualCredential := decision.Stage == agenticv1alpha1.ApprovalStageExecution &&
+		!decision.Denied && runCR.Spec.TargetCluster != "" && h.deps.ExecutionTokenExchanger != nil
+	if dualCredential {
+		identity, current := h.latestAnalysisIdentity(ctx, runCR)
+		if !current || identity == "" {
+			return false, fmt.Errorf("%w: current analysis is not ready for execution approval; retry after analysis completes", a2a.ErrInvalidParams)
+		}
+		principal := auth.PrincipalID(cred.Subject, cred.Issuer)
+		if err := h.recordApprovedAnalysis(ctx, runCR, principal, identity); err != nil {
+			return false, fmt.Errorf("%w: %v", a2a.ErrInternalError, err)
+		}
+		if err := h.renewExecutionApprovalCredentials(ctx, cred, rec, runCR); err != nil {
+			return false, err
+		}
 	}
 	if err := rc.UpdateApproval(ctx, approval); err != nil {
-		return fmt.Errorf("%w: %v", a2a.ErrInternalError, err)
+		if dualCredential {
+			latest, readErr := h.deps.Results.GetApproval(ctx, h.cfg.Namespace, rec.RunName)
+			if readErr != nil {
+				// An uncertain read cannot establish that approval is absent.
+				// Leave cleanup to the durable sweeper rather than removing a
+				// credential for an approval that may have committed.
+				h.deps.Logger.Warn("approval update failed and current decision could not be read; defer execution-token reconciliation",
+					"task_id", rec.TaskID, "run", rec.RunName, "error", readErr)
+			} else if !executionStageApproved(latest) {
+				if cleanupErr := h.deps.Tokens.RemoveExecution(ctx, string(runCR.UID)); cleanupErr != nil {
+					h.deps.Logger.Error("remove execution token after approval patch failure", "task_id", rec.TaskID, "run", rec.RunName, "error", cleanupErr)
+				}
+			}
+		}
+		return false, fmt.Errorf("%w: %v", a2a.ErrInternalError, err)
 	}
 	h.deps.Logger.Info("forwarded approval decision",
 		"task_id", rec.TaskID, "run", rec.RunName, "stage", decision.Stage,
-		"decision", dec, "principal", auth.PrincipalID(cred.Subject, cred.Issuer))
+		"decision", requestedDecision, "principal", auth.PrincipalID(cred.Subject, cred.Issuer))
+	return false, nil
+}
+
+func (h *Handler) renewExecutionApprovalCredentials(ctx context.Context, cred *auth.Credential, rec *store.TaskRecord, runCR *agenticv1alpha1.AgenticRun) error {
+	runToken, err := h.runCredential(ctx, cred)
+	if err != nil {
+		return err
+	}
+	executionToken, err := h.executionCredential(ctx, cred)
+	if err != nil {
+		return err
+	}
+	if err := h.deps.Tokens.WriteWithExecution(ctx, runCR, runToken, executionToken); err != nil {
+		return fmt.Errorf("%w: %v", a2a.ErrInternalError, err)
+	}
+	h.deps.Logger.Info("prepared execution credentials for approved analysis",
+		"task_id", rec.TaskID, "run", rec.RunName, "credential_fp", cred.Fingerprint)
 	return nil
+}
+
+// executionApprovedAndPending is recomputed from durable CR state for every
+// renewal. The execution credential is needed after approval but must be
+// removed once execution has reported completion/failure.
+func (h *Handler) executionApprovedAndPending(ctx context.Context, runCR *agenticv1alpha1.AgenticRun) bool {
+	return h.executionCredentialAllowed(ctx, runCR)
 }
 
 // ---- a2asrv.RequestHandler -------------------------------------------------
@@ -1110,6 +1512,11 @@ func (h *Handler) OnSendMessage(ctx context.Context, params *a2a.MessageSendPara
 // pushed out and the pause's own bound (§6.4) ends the stream instead.
 func (h *Handler) OnSendMessageStream(ctx context.Context, params *a2a.MessageSendParams) iter.Seq2[a2a.Event, error] {
 	return func(yield func(a2a.Event, error) bool) {
+		approvalContinuation := false
+		if params != nil && params.Message != nil && params.Message.TaskID != "" {
+			decision, _ := approvalDecisionOf(params.Message)
+			approvalContinuation = decision != nil
+		}
 		task, err := h.handleSend(ctx, params)
 		if err != nil {
 			yield(nil, err)
@@ -1128,7 +1535,8 @@ func (h *Handler) OnSendMessageStream(ctx context.Context, params *a2a.MessageSe
 			yield(h.statusEvent(task, task.Status.State, true), nil)
 			return
 		}
-		h.streamUpdates(ctx, string(task.ID), yield)
+		h.streamUpdates(ctx, string(task.ID), yield,
+			approvalContinuation && task.Status.State == a2a.TaskStateInputRequired)
 	}
 }
 
@@ -1141,11 +1549,18 @@ func taskHasRun(s *store.Store, taskID string) bool {
 // tasks/resubscribe: subscribe to the task's store signal, project on
 // every wake-up, emit artifact events for new artifacts and status events
 // for state changes, end on terminal or deadline.
-func (h *Handler) streamUpdates(ctx context.Context, taskID string, yield func(a2a.Event, error) bool) {
+func (h *Handler) streamUpdates(ctx context.Context, taskID string, yield func(a2a.Event, error) bool, waitPastInputRequired bool) {
 	signals, cancel := h.deps.Store.Subscribe(taskID)
 	defer cancel()
 
 	state := a2a.TaskStateUnspecified
+	if waitPastInputRequired {
+		// The task yielded by message/stream already contains this checkpoint.
+		// Do not finalize the approval-response stream on the unchanged old
+		// Proposed phase; wait for execution, a terminal result, or a new
+		// input-required checkpoint after a real transition.
+		state = a2a.TaskStateInputRequired
+	}
 	emitted := map[a2a.ArtifactID]bool{}
 	// Anchored once; not armed at all while the task sits in a renewal
 	// pause (§2.3 — the pause has its own §6.4 bound).
@@ -1177,7 +1592,7 @@ func (h *Handler) streamUpdates(ctx context.Context, taskID string, yield func(a
 		}
 		if task.Status.State != state {
 			state = task.Status.State
-			final := TerminalState(state)
+			final := StreamFinalState(state)
 			if !yield(h.statusEvent(task, state, final), nil) {
 				return
 			}
@@ -1232,6 +1647,14 @@ func (h *Handler) streamUpdates(ctx context.Context, taskID string, yield func(a
 
 func (h *Handler) statusEvent(task *a2a.Task, state a2a.TaskState, final bool) a2a.Event {
 	now := h.cfg.now()
+	message := &a2a.Message{
+		Role:  a2a.MessageRoleAgent,
+		ID:    string(a2a.NewTaskID()),
+		Parts: []a2a.Part{a2a.TextPart{Text: streamStatusText(state, task)}},
+	}
+	if state == a2a.TaskStateInputRequired && task.Status.Message != nil {
+		message = task.Status.Message
+	}
 	return &a2a.TaskStatusUpdateEvent{
 		TaskID:    task.ID,
 		ContextID: task.ContextID,
@@ -1239,11 +1662,7 @@ func (h *Handler) statusEvent(task *a2a.Task, state a2a.TaskState, final bool) a
 		Status: a2a.TaskStatus{
 			State:     state,
 			Timestamp: &now,
-			Message: &a2a.Message{
-				Role:  a2a.MessageRoleAgent,
-				ID:    string(a2a.NewTaskID()),
-				Parts: []a2a.Part{a2a.TextPart{Text: streamStatusText(state, task)}},
-			},
+			Message:   message,
 		},
 	}
 }
@@ -1346,7 +1765,7 @@ func (h *Handler) OnResubscribeToTask(ctx context.Context, params *a2a.TaskIDPar
 			yield(h.statusEvent(task, task.Status.State, true), nil)
 			return
 		}
-		h.streamUpdates(ctx, string(params.ID), yield)
+		h.streamUpdates(ctx, string(params.ID), yield, false)
 	}
 }
 

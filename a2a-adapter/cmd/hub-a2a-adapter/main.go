@@ -110,25 +110,40 @@ func mainRun() error {
 		}
 		runTokenExchanger = rte
 	}
+	// Execution credentials are minted only for an approved Execution
+	// decision. Config validation requires the run-token exchanger too.
+	var executionTokenExchanger auth.Exchanger
+	if cfg.ExecutionTokenAudience != "" {
+		executionCfg := exchangeCfg
+		executionCfg.Audience = cfg.ExecutionTokenAudience
+		ete, err := auth.NewTokenExchanger(executionCfg)
+		if err != nil {
+			return err
+		}
+		executionTokenExchanger = ete
+	}
 
 	handler, err := server.New(server.Config{
-		Namespace:            cfg.Namespace,
-		TargetHeader:         cfg.TargetHeader,
-		AllowedTargets:       cfg.AllowedTargets,
-		ClockSkew:            cfg.ClockSkew,
-		StreamDeadline:       cfg.StreamDeadline,
-		RenewalTimeout:       cfg.RenewalTimeout,
-		MaxPauses:            cfg.MaxPauses,
-		TerminalCleanupGrace: cfg.TerminalCleanupGrace,
-		SweepInterval:        cfg.SweepInterval,
+		Namespace:              cfg.Namespace,
+		RunTokenAudience:       cfg.RunTokenAudience,
+		ExecutionTokenAudience: cfg.ExecutionTokenAudience,
+		TargetHeader:           cfg.TargetHeader,
+		AllowedTargets:         cfg.AllowedTargets,
+		ClockSkew:              cfg.ClockSkew,
+		StreamDeadline:         cfg.StreamDeadline,
+		RenewalTimeout:         cfg.RenewalTimeout,
+		MaxPauses:              cfg.MaxPauses,
+		TerminalCleanupGrace:   cfg.TerminalCleanupGrace,
+		SweepInterval:          cfg.SweepInterval,
 	}, server.Deps{
-		Store:             store.New(),
-		Credentials:       credentialSource(cfg.InboundHubToken),
-		Exchanger:         exchanger,
-		RunTokenExchanger: runTokenExchanger,
-		Readers:           kube,
-		Results:           kube,
-		Submitters:        run.NewCtrlRunClientFactory(restCfg, scheme),
+		Store:                   store.New(),
+		Credentials:             credentialSource(cfg.InboundHubToken),
+		Exchanger:               exchanger,
+		RunTokenExchanger:       runTokenExchanger,
+		ExecutionTokenExchanger: executionTokenExchanger,
+		Readers:                 kube,
+		Results:                 kube,
+		Submitters:              run.NewCtrlRunClientFactory(restCfg, scheme),
 		Runs: &run.Creator{
 			Namespace: cfg.Namespace,
 			AgentName: cfg.RunAgent,

@@ -8,6 +8,7 @@ import (
 	agenticv1alpha1 "github.com/openshift/lightspeed-agentic-operator/api/v1alpha1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/util/retry"
 
 	"github.com/openshift/lightspeed-hub/a2a-adapter/internal/store"
 )
@@ -29,6 +30,12 @@ const (
 	// the count changes; read back on rehydration (server.recordFromRun).
 	// Part of the README's restart-recovery contract.
 	AnnotationCredentialPauses = "a2a.lightspeed.io/credential-pauses"
+	// AnnotationRevisedBy records the verified principal who requested the
+	// latest same-run revision. It never contains a credential.
+	AnnotationRevisedBy = "a2a.lightspeed.io/revised-by"
+	// AnnotationApprovedAnalysis binds execution credentials to the exact
+	// successful analysis selected for the execution approval.
+	AnnotationApprovedAnalysis = "a2a.lightspeed.io/approved-analysis"
 )
 
 // ErrRunCollision means a deterministic run name already exists with a
@@ -36,12 +43,16 @@ const (
 // silent second run.
 var ErrRunCollision = errors.New("agenticrun name collision: existing run with different spec")
 
+// ErrRevisionNotOwned indicates that the fetched run no longer carries the
+// principal validated by the handler; it is masked as TaskNotFound.
+var ErrRevisionNotOwned = errors.New("agenticrun ownership changed before revision")
+
 // Creator maps an A2A submission onto an AgenticRun (design §4.1).
 //
 // Mapping decisions (design §4.1, restated):
-//   - analysis-only: execution/verification steps are omitted — the A2A
-//     caller asked a question; a follow-up that needs execution is a new
-//     task/run. The CRD makes step fields immutable anyway.
+//   - every run includes analysis, execution, and verification steps. The
+//     cluster ApprovalPolicy gates execution for human approval; the adapter
+//     does not create analysis-only runs based on request content.
 //   - request = the A2A message's text parts, joined verbatim.
 //   - revisionFeedback (the CRD's built-in same-run refinement path) is the
 //     adapter's "revise" follow-up DataPart.
@@ -92,6 +103,8 @@ func (c *Creator) NewRun(in NewRunInput) *agenticv1alpha1.AgenticRun {
 			Request:       in.Request,
 			TargetCluster: in.Target,
 			Analysis:      agenticv1alpha1.AgenticRunStep{Agent: c.AgentName},
+			Execution:     agenticv1alpha1.AgenticRunStep{Agent: c.AgentName},
+			Verification:  agenticv1alpha1.AgenticRunStep{Agent: c.AgentName},
 		},
 	}
 }
@@ -124,23 +137,37 @@ func (c *Creator) Submit(ctx context.Context, rc RunClient, run *agenticv1alpha1
 func sameSpec(a, b *agenticv1alpha1.AgenticRun) bool {
 	return a.Spec.Request == b.Spec.Request &&
 		a.Spec.TargetCluster == b.Spec.TargetCluster &&
-		a.Spec.Analysis.Agent == b.Spec.Analysis.Agent
+		a.Spec.Analysis.Agent == b.Spec.Analysis.Agent &&
+		a.Spec.Execution.Agent == b.Spec.Execution.Agent &&
+		a.Spec.Verification.Agent == b.Spec.Verification.Agent &&
+		a.Spec.AnalysisOutput.Mode == b.Spec.AnalysisOutput.Mode
 }
 
 // SubmitRevision patches spec.revisionFeedback on an existing run — the
 // CRD's built-in "same run, refined question" path (design §4.1): patching
 // bumps generation and triggers re-analysis with the feedback appended.
-func (c *Creator) SubmitRevision(ctx context.Context, rc RunClient, runName, feedback string) error {
+// rc must be the adapter-SA client, and principal must already have passed
+// task ownership/context/target validation in the handler.
+func (c *Creator) SubmitRevision(ctx context.Context, rc RunClient, runName, feedback, principal string) error {
 	if feedback == "" {
 		return errors.New("revision feedback is empty")
 	}
-	run, err := rc.GetRun(ctx, c.Namespace, runName)
-	if err != nil {
-		return fmt.Errorf("get agenticrun %s for revision: %w", runName, err)
-	}
-	run.Spec.RevisionFeedback = feedback
-	if err := rc.UpdateRun(ctx, run); err != nil {
-		return fmt.Errorf("update agenticrun %s revisionFeedback: %w", runName, err)
-	}
-	return nil
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		run, err := rc.GetRun(ctx, c.Namespace, runName)
+		if err != nil {
+			return fmt.Errorf("get agenticrun %s for revision: %w", runName, err)
+		}
+		if principal == "" || run.Annotations[AnnotationPrincipal] != principal {
+			return ErrRevisionNotOwned
+		}
+		run.Spec.RevisionFeedback = feedback
+		if run.Annotations == nil {
+			run.Annotations = map[string]string{}
+		}
+		run.Annotations[AnnotationRevisedBy] = principal
+		if err := rc.UpdateRun(ctx, run); err != nil {
+			return fmt.Errorf("update agenticrun %s revisionFeedback: %w", runName, err)
+		}
+		return nil
+	})
 }

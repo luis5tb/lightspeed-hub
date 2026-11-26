@@ -59,6 +59,11 @@ type TaskRecord struct {
 	// AuthPausedAt is when the CURRENT pause started — the anchor for the
 	// per-pause renewal deadline (design §6.4).
 	AuthPausedAt time.Time
+	// CredentialPauseObservedAt identifies the CredentialsExpired condition
+	// already handled by this process. A successful renewal clears AuthPaused
+	// before the operator clears that condition; this marker prevents a sweep
+	// or delayed watch replay from re-applying the same pause.
+	CredentialPauseObservedAt time.Time
 	// PauseCount is how many times the bound run has paused for
 	// credentials. Capped by MaxPauses (design §6.4) so a flapping
 	// credential cannot pause-loop forever.

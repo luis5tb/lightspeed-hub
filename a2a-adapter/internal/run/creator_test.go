@@ -33,13 +33,16 @@ func TestNewRunMapping(t *testing.T) {
 	if run.Spec.TargetCluster != "spoke-a" {
 		t.Errorf("target = %q", run.Spec.TargetCluster)
 	}
-	// Analysis-only (design §4.1) and the agent is set explicitly: the
-	// CRD's MinProperties=1 rejects a literal "analysis: {}".
+	// Every run has all workflow steps and the agent is set explicitly:
+	// the CRD's MinProperties=1 rejects literal empty step objects.
 	if run.Spec.Analysis.Agent != "default" {
 		t.Errorf("analysis agent = %q", run.Spec.Analysis.Agent)
 	}
-	if !run.Spec.Execution.IsZero() || !run.Spec.Verification.IsZero() {
-		t.Error("run must be analysis-only")
+	if run.Spec.Execution.Agent != "default" || run.Spec.Verification.Agent != "default" {
+		t.Errorf("execution/verification agents = %q/%q, want default/default", run.Spec.Execution.Agent, run.Spec.Verification.Agent)
+	}
+	if run.Spec.AnalysisOutput.Mode == "Minimal" {
+		t.Fatal("analysisOutput Minimal is incompatible with execution")
 	}
 	wantAnnotations := map[string]string{
 		AnnotationTaskID:     "task-1",
@@ -97,7 +100,7 @@ func TestSubmitRevision(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := c.SubmitRevision(context.Background(), runs, submitted.Name, "focus on the networking angle"); err != nil {
+	if err := c.SubmitRevision(context.Background(), runs, submitted.Name, "focus on the networking angle", "p"); err != nil {
 		t.Fatal(err)
 	}
 	got, _ := runs.GetRun(context.Background(), "test-ns", submitted.Name)
@@ -106,6 +109,9 @@ func TestSubmitRevision(t *testing.T) {
 	}
 	if got.Spec.Request != "q" {
 		t.Errorf("request must stay immutable: %q", got.Spec.Request)
+	}
+	if got.Annotations[AnnotationRevisedBy] != "p" {
+		t.Errorf("revised-by annotation = %q", got.Annotations[AnnotationRevisedBy])
 	}
 }
 

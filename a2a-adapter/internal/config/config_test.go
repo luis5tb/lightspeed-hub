@@ -122,6 +122,18 @@ func TestValidate(t *testing.T) {
 		}
 	})
 
+	t.Run("execution audience requires run audience", func(t *testing.T) {
+		c := validCfg()
+		c.ExecutionTokenAudience = "spoke-execution"
+		if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "--execution-token-audience requires --run-token-audience") {
+			t.Fatalf("want execution/run audience dependency error, got %v", err)
+		}
+		c.RunTokenAudience = "spoke-reader"
+		if err := c.Validate(); err != nil {
+			t.Fatalf("execution audience with run audience rejected: %v", err)
+		}
+	})
+
 	t.Run("namespace fallback", func(t *testing.T) {
 		c := validCfg()
 		c.Namespace = ""

@@ -32,6 +32,47 @@ The adapter's own Keycloak client auth for the A→H exchange is either a
 confidential client secret or a SPIFFE JWT-SVID client assertion
 (`SPIFFE_SOCKET` / `--svid-socket`).
 
+## Approval checkpoint and execution credentials
+
+Every run includes Analysis, Execution, and Verification using the same
+`--run-agent`. The cluster's approval policy is expected to make Analysis
+automatic, Execution manual, and Verification/Escalation automatic. Once
+analysis completes, the adapter projects the pending approval as an
+`input-required` status update containing both a human-readable TextPart and
+this DataPart shape:
+
+```json
+{"approvalRequest":{"stage":"Execution","run":"a2a-...","targetCluster":"east","options":[{"index":0,"number":1,"title":"Restart the service","summary":"Restart the workload safely."}],"decisions":["approve","reject"]}}
+```
+
+The payload has exactly `stage`, `run`, `targetCluster`, `options`, and
+`decisions`. Options come from the newest successful
+`AnalysisResult.Status.Options`: `index` is the zero-based execution option
+index, `number` is its one-based display choice, `title` and `summary` map
+from the result, and summary is truncated to 500 Unicode runes. If that
+result is missing or unreadable, `options` is empty. A decision is a
+DataPart on the same task with a new messageId, such as
+`{"approve":{"stage":"Execution","option":0}}` (option is the
+zero-based index) or `{"reject":{"stage":"Execution"}}`.
+
+`message/send` returns the Proposed/input-required task immediately. For
+`message/stream`, the initial approval checkpoint is emitted with `Final:
+true` and that stream ends; after a decision follow-up, a new stream waits
+past the unchanged Proposed checkpoint and streams the continuing run until
+terminal or another checkpoint. An Execution denial after successful
+analysis completes with the analysis artifact and the status message
+`Execution rejected by approver; analysis result attached.`
+
+Execution-only credentials are opt-in. Set `--run-token-audience` for the
+reader token (`token-a`) and set `--execution-token-audience` to enable
+`token-execution`; the latter also accepts `EXECUTION_TOKEN_AUDIENCE` as an
+environment fallback. An empty execution audience leaves the legacy
+behavior unchanged, while a non-empty execution audience without
+`--run-token-audience` is rejected at startup. The adapter writes both
+credentials before patching an approval as the caller, renews both while an
+approved execution is pending/running, and removes `token-execution` when
+execution completes.
+
 ## Placement: internal-only, behind Praxis
 
 The adapter's Service is internal-only (ClusterIP, no Route, ever) with a
